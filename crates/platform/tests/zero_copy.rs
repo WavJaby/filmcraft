@@ -49,7 +49,7 @@ fn plan(frame: &Arc<VideoFrame>) -> FramePlan {
 }
 
 fn render(c: &mut GpuCompositor, frame: &Arc<VideoFrame>) -> Vec<u8> {
-    c.composite(&plan(frame));
+    c.composite(&plan(frame)).unwrap();
     c.read_output().expect("readback").2
 }
 
@@ -89,7 +89,7 @@ fn gpu_pictures_composite_like_uploaded_ones_and_read_back_exactly() {
         for (z, c) in zero.iter().zip(&soft) {
             assert_eq!(z.pts, c.pts, "{name}: order");
             // CPU consumers: the downloaded planes are the software decoder's exactly
-            let down = z.frame.cpu();
+            let down = z.frame.cpu().unwrap();
             assert_same(
                 &format!("{name} pts {}", z.pts),
                 &[filmcraft_codecs::DecodedFrame { pts: z.pts, frame: down.into_owned(), draft: false }],

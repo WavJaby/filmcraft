@@ -587,7 +587,7 @@ pub(crate) fn place_sequence_clips(
 /// The most tracks one `sequence.addTracks` adds of a kind, and the most a sequence may then
 /// have of it. (Amounts come from dialogs, scripts and the control channel: never trusted.)
 const MAX_ADDED_TRACKS: u64 = 99;
-const MAX_TRACKS: usize = 999;
+pub(crate) const MAX_TRACKS: usize = 999;
 
 /// Where `sequence.addTracks` puts new tracks among the `len` tracks of their kind: the number of
 /// tracks before them. `key` holds `"first"` (Before First Track), a track of that kind by name

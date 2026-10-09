@@ -251,7 +251,11 @@ pub(crate) fn media_info(name: &str, spec: &MediaSpec) -> MediaInfo {
             bitrate: None,
             hdr: None,
         }),
-        audio: spec.audio.map(|(sr, ch)| AudioStreamInfo { sample_rate: sr, channels: ch, codec: String::new(), bits_per_sample: None }),
+        audio_streams: spec
+            .audio
+            .map(|(sr, ch)| AudioStreamInfo { sample_rate: sr, channels: ch, codec: String::new(), bits_per_sample: None })
+            .into_iter()
+            .collect(),
         container: String::new(),
         start_timecode: spec.start_tc,
         file_size: None,
@@ -443,6 +447,7 @@ impl Builder {
             hold_filters: false,
             field_options: None,
             source_channels: Vec::new(),
+            audio_stream: 0,
             graphic: None,
         }
     }

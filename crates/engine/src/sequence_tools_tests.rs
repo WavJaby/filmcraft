@@ -483,3 +483,24 @@ fn selection_follows_playhead() {
     s.execute("playhead.set", json!({"frame": 10})).unwrap();
     assert_eq!(s.state.selection, sel, "off again");
 }
+
+/// #208: with no In / Out mark, Go to In / Go to Out move to the start / end of the sequence
+/// (they did nothing); with marks they go to them.
+#[test]
+fn go_to_in_out_without_marks_go_to_the_sequence_ends() {
+    let mut s = demo();
+    let end = s.active_sequence().unwrap().duration();
+    let mid = filmcraft_time::Tick(end.0 / 2);
+    s.execute("playhead.set", json!({"time": mid.0})).unwrap();
+    s.execute("markers.goToIn", json!({})).unwrap();
+    assert_eq!(s.playhead(), filmcraft_time::Tick::ZERO, "the start");
+    s.execute("markers.goToOut", json!({})).unwrap();
+    assert_eq!(s.playhead(), end, "the end");
+    // with marks, the marks
+    let at = filmcraft_time::Tick(end.0 / 4);
+    s.execute("playhead.set", json!({"time": at.0})).unwrap();
+    s.execute("markers.markIn", json!({})).unwrap();
+    s.execute("playhead.set", json!({"time": mid.0})).unwrap();
+    s.execute("markers.goToIn", json!({})).unwrap();
+    assert_eq!(s.playhead(), s.active_sequence().unwrap().mark_in.unwrap());
+}

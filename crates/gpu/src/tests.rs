@@ -73,7 +73,7 @@ fn imported_sources_obey_cache_budget_and_release_evicted_owners() {
             par: (1, 1),
             pts: Default::default(),
         };
-        c.upload(&f, None);
+        c.upload(&f, None).unwrap();
         assert!(c.uploads.len() <= SOURCE_CACHE_CAPACITY);
     }
     assert_eq!(owners.iter().filter(|w| w.strong_count() > 0).count(), SOURCE_CACHE_CAPACITY);
@@ -138,6 +138,63 @@ impl filmcraft_frame::GpuSurface for CpuFallbackSurface {
 }
 
 #[test]
+fn failed_import_fallback_never_caches_or_uploads_substitute_pixels() {
+    #[derive(Debug)]
+    struct Lost;
+    impl filmcraft_frame::GpuSurface for Lost {
+        fn size(&self) -> (u32, u32) {
+            (2, 2)
+        }
+        fn byte_len(&self) -> usize {
+            6
+        }
+        fn id(&self) -> u64 {
+            u64::MAX - 1
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn download(&self) -> Result<PixelData, String> {
+            Err("injected readback failure".into())
+        }
+    }
+    let Some((dev, queue)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let frame = Arc::new(VideoFrame {
+        data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(Arc::new(Lost), Chroma::C420, 8)),
+        ..VideoFrame::rgba8(2, 2, vec![0; 2 * 2 * 4])
+    });
+    let plan = FramePlan::Layers { width: 2, height: 2, layers: vec![PlanLayer::new(frame.clone(), Affine::IDENTITY, 1.0, Blend::Normal)] };
+    let mut compositor = GpuCompositor::new(&dev, &queue);
+    assert_eq!(compositor.composite(&plan).unwrap_err(), "injected readback failure");
+    assert_eq!(compositor.uploaded_bytes, 0);
+    assert!(compositor.uploads.is_empty());
+
+    let good = PlanLayer::new(Arc::new(VideoFrame::rgba8(2, 2, vec![255; 2 * 2 * 4])), Affine::IDENTITY, 1.0, Blend::Normal);
+    let valid = FramePlan::Layers { width: 2, height: 2, layers: vec![good.clone()] };
+    compositor.composite(&valid).unwrap();
+    let expected = compositor.read_output().unwrap();
+    let parent = compositor.accum.as_ref().unwrap().0.clone();
+    for failed_input in 0..2 {
+        let bad = PlanLayer::new(frame.clone(), Affine::IDENTITY, 1.0, Blend::Normal);
+        let mut inputs = [vec![good.clone()], vec![good.clone()]];
+        inputs[failed_input] = vec![bad];
+        let transition = FramePlan::Composite {
+            width: 2,
+            height: 2,
+            steps: vec![PlanStep::Transition { inputs, effect: filmcraft_project::find_effect("push").unwrap().instance(), progress: 0.5, scale: 1.0 }],
+        };
+        assert_eq!(compositor.composite(&transition).unwrap_err(), "injected readback failure");
+        assert_eq!(compositor.accum.as_ref().unwrap().0, parent, "parent accumulator restored after input {failed_input}");
+        assert_eq!(compositor.gpu_transitions, 0);
+        compositor.composite(&valid).unwrap();
+        assert_eq!(compositor.read_output().unwrap(), expected);
+    }
+}
+
+#[test]
 fn unsupported_surface_import_downloads_once_and_reuses_cpu_upload() {
     let Some((dev, q)) = device() else {
         eprintln!("no GPU adapter; skipping");
@@ -157,10 +214,10 @@ fn unsupported_surface_import_downloads_once_and_reuses_cpu_upload() {
     let mut c = GpuCompositor::new(&dev, &q);
     let expected = [0, 0, 0, 255].repeat(2 * 2); // Limited-range Y16/C128 -> opaque black.
     let expected_bytes = 2 * 2 + 2; // 2x2 luma + one sample per chroma plane, all u8.
-    c.composite(&plan);
+    c.composite(&plan).unwrap();
     assert_eq!(c.read_output().expect("fallback pixels").2, expected);
     assert_eq!(c.uploaded_bytes, expected_bytes);
-    c.composite(&plan);
+    c.composite(&plan).unwrap();
     assert_eq!(c.read_output().expect("reused fallback pixels").2, expected);
     assert_eq!(c.uploaded_bytes, expected_bytes);
     assert_eq!(surface.0.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -194,19 +251,19 @@ fn yuv_code_range_gpu_matches_cpu() {
                     par: (1, 1),
                     pts: Default::default(),
                 });
-                let cpu = frame.to_rgba8();
+                let cpu = frame.to_rgba8().unwrap();
                 let plan = FramePlan::Layers { width: 256, height: 1, layers: vec![PlanLayer::new(frame, Affine::IDENTITY, 1.0, Blend::Normal)] };
-                c.composite(&plan);
+                c.composite(&plan).unwrap();
                 let (w, h, gpu) = c.read_output().expect("readback");
                 assert_eq!((w, h, gpu.len()), (256, 1, cpu.len()));
                 let error = cpu.iter().zip(&gpu).map(|(a, b)| a.abs_diff(*b)).max().expect("pixels");
                 // One output-code tolerance: CPU f32 vs GPU f16 accumulator quantization.
                 assert!(error <= 1, "{bits}-bit {range:?} U={u} V={v}: max error {error}");
                 if u == 128 && v == 128 {
-                    assert!(gpu.chunks_exact(4).all(|p| p[0] == p[1] && p[1] == p[2]), "neutral tint: {bits}-bit {range:?}");
+                    assert!(gpu.as_chunks::<4>().0.iter().all(|p| p[0] == p[1] && p[1] == p[2]), "neutral tint: {bits}-bit {range:?}");
                 }
                 let prepared = prepare(&plan);
-                prepared_compositor.composite_prepared(&plan, Some(&prepared));
+                prepared_compositor.composite_prepared(&plan, Some(&prepared)).unwrap();
                 assert_eq!(prepared_compositor.read_output().expect("prepared readback").2, gpu, "prepared: {bits}-bit {range:?}");
                 eprintln!("range gate: {bits}-bit {range:?} U={u} V={v}, max error={error}, prepared=inline");
             }
@@ -260,8 +317,8 @@ fn gpu_matches_cpu_plan() {
             },
         ],
     };
-    let cpu = execute_cpu(&plan).over_black_rgba8();
-    c.composite(&plan);
+    let cpu = execute_cpu(&plan).unwrap().over_black_rgba8();
+    c.composite(&plan).unwrap();
     let (gw, gh, gpu) = c.read_output().expect("readback");
     assert_eq!((gw as usize, gh as usize), (w, h));
     // compare away from antialiased edges: mean abs error and 99th percentile
@@ -273,7 +330,7 @@ fn gpu_matches_cpu_plan() {
     assert!(p99 <= 6 && mean < 1.5, "p99 {p99}, mean {mean}");
     // cache: compositing the same plan again uploads nothing
     let before = c.uploaded_bytes;
-    c.composite(&plan);
+    c.composite(&plan).unwrap();
     assert_eq!(c.uploaded_bytes, before);
 }
 
@@ -288,6 +345,101 @@ fn half_float_conversion() {
         let d = if e == 0 { s * m * 2f32.powi(-24) } else { s * (1.0 + m / 1024.0) * 2f32.powi(e - 15) };
         assert!((d - v).abs() <= v.abs() * 1e-3 + 1e-6, "{v} → {d}");
     }
+}
+
+#[test]
+fn gpu_push_matches_cpu_with_alpha_and_surrounding_blends() {
+    use filmcraft_project::ParamValue;
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (128usize, 72usize);
+    let layer = |side: usize| {
+        let px = (0..w * h)
+            .flat_map(|i| {
+                let u = (i % w % 2) as f32;
+                let v = (i / w % 2) as f32;
+                let a = if side == 0 { (u + v) / 2.0 } else { 1.0 - (u + v) / 2.0 };
+                [u * a, v * a, 0.5 * a, a]
+            })
+            .collect();
+        PlanLayer::new(Arc::new(VideoFrame::rgba_f32(w as u32, h as u32, px)), Affine::IDENTITY, 0.7, Blend::Normal)
+    };
+    let mut worst = (0, 0.0f64);
+    for direction in 0..4 {
+        for blur in [0.0, 50.0, 100.0] {
+            for progress in [0.0, 0.25, 0.37, 0.5, 0.75, 1.0] {
+                let mut effect = filmcraft_project::find_effect("push").unwrap().instance();
+                effect.param_mut("direction").unwrap().value = ParamValue::Choice(direction);
+                effect.param_mut("motion_blur").unwrap().value = ParamValue::Float(blur);
+                let mut above = layer(1);
+                above.blend = Blend::Multiply;
+                let plan = FramePlan::Composite {
+                    width: w,
+                    height: h,
+                    steps: vec![
+                        PlanStep::Layers(vec![layer(1)]),
+                        PlanStep::Transition { inputs: [vec![layer(0)], vec![layer(1)]], effect, progress, scale: 1.0 },
+                        PlanStep::Layers(vec![above]),
+                    ],
+                };
+                let cpu = execute_cpu(&plan).unwrap().over_black_rgba8();
+                c.composite_prepared(&plan, Some(&prepare(&plan))).unwrap();
+                let (_, _, gpu) = c.read_output().expect("readback");
+                let mut diffs: Vec<u32> =
+                    cpu.as_chunks::<4>().0.iter().zip(gpu.as_chunks::<4>().0).map(|(a, b)| (0..3).map(|k| a[k].abs_diff(b[k]) as u32).max().unwrap()).collect();
+                diffs.sort_unstable();
+                let p99 = diffs[diffs.len() * 99 / 100];
+                let mean = diffs.iter().sum::<u32>() as f64 / diffs.len() as f64;
+                worst = (worst.0.max(p99), worst.1.max(mean));
+                // Existing compositor acceptance band; moving edges included.
+                assert!(p99 <= 6 && mean < 1.5, "direction {direction}, blur {blur}, progress {progress}: p99 {p99}, mean {mean}");
+            }
+        }
+    }
+    assert_eq!(c.gpu_transitions, 4 * 3 * 6);
+    assert_eq!(c.cpu_transitions, 0);
+    eprintln!("Push 72 cases: worst p99 {}, mean {}", worst.0, worst.1);
+    let fallback = FramePlan::Composite {
+        width: w,
+        height: h,
+        steps: vec![PlanStep::Transition {
+            inputs: [vec![layer(0)], vec![layer(1)]],
+            effect: filmcraft_project::find_effect("cross_dissolve").unwrap().instance(),
+            progress: 0.37,
+            scale: 1.0,
+        }],
+    };
+    c.composite(&fallback).unwrap();
+    let (_, _, got) = c.read_output().expect("fallback readback");
+    let expected = execute_cpu(&fallback).unwrap().over_black_rgba8();
+    assert!(got.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1));
+    assert_eq!(c.cpu_transitions, 1);
+    assert_eq!(c.gpu_transitions, 4 * 3 * 6);
+
+    // Reuse both input targets across ordered transitions; preparation advances past intervening layers.
+    let transition = |progress| PlanStep::Transition {
+        inputs: [vec![layer(0)], vec![layer(1)]],
+        effect: filmcraft_project::find_effect("push").unwrap().instance(),
+        progress,
+        scale: 1.0,
+    };
+    let mut middle = layer(0);
+    middle.blend = Blend::Screen;
+    let stacked = FramePlan::Composite {
+        width: w,
+        height: h,
+        steps: vec![PlanStep::Layers(vec![layer(1)]), transition(0.25), PlanStep::Layers(vec![middle]), transition(0.75)],
+    };
+    c.composite_prepared(&stacked, Some(&prepare(&stacked))).unwrap();
+    let (_, _, gpu) = c.read_output().expect("stacked readback");
+    let cpu = execute_cpu(&stacked).unwrap().over_black_rgba8();
+    // One byte level tolerates half-float resolve rounding.
+    assert!(gpu.iter().zip(cpu).all(|(a, b)| a.abs_diff(b) <= 1), "stacked transitions exceed one byte level");
+    assert_eq!(c.gpu_transitions, 4 * 3 * 6 + 2);
+    assert_eq!(c.cpu_transitions, 1);
 }
 
 #[test]
@@ -327,12 +479,12 @@ fn prepared_upload_matches_inline_conversion() {
     let image = FramePlan::Image(filmcraft_render::Image { w: w as usize, h: h as usize, px: f32_layer });
     for plan in [layers, image] {
         let mut a = GpuCompositor::new(&dev, &q);
-        a.composite(&plan);
+        a.composite(&plan).unwrap();
         let inline = a.read_output().expect("readback");
         let mut b = GpuCompositor::new(&dev, &q);
         let prep = prepare(&plan);
         assert!(prep.bytes() > 0);
-        b.composite_prepared(&plan, Some(&prep));
+        b.composite_prepared(&plan, Some(&prep)).unwrap();
         let prepared = b.read_output().expect("readback");
         assert!(inline == prepared, "prepared upload differs");
     }
@@ -352,7 +504,7 @@ fn upload_cache_keeps_buffers_alive() {
     let frame = Arc::new(VideoFrame { width: 16, height: 8, data: PixelData::Rgba8(px.clone()), ..(*yuv_frame(16, 8)).clone() });
     let plan =
         FramePlan::Layers { width: 16, height: 8, layers: vec![PlanLayer { frame, matrix: Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None }] };
-    c.composite(&plan);
+    c.composite(&plan).unwrap();
     drop(plan);
     assert!(Arc::strong_count(&px) > 1, "cached upload must own its pixel buffer");
 }
@@ -504,8 +656,8 @@ fn gpu_draws_yuv_alpha_plane_like_the_cpu() {
                 PlanLayer { frame: yuv_alpha_frame(320, 180, bits), matrix: Affine::IDENTITY, opacity: 0.9, blend: Blend::Normal, fx: None },
             ],
         };
-        let cpu = execute_cpu(&plan).over_black_rgba8();
-        c.composite(&plan);
+        let cpu = execute_cpu(&plan).unwrap().over_black_rgba8();
+        c.composite(&plan).unwrap();
         let (_, _, gpu) = c.read_output().expect("readback");
         let mut diffs: Vec<u32> =
             cpu.chunks(4).zip(gpu.chunks(4)).map(|(a, b)| (0..3).map(|k| (a[k] as i32 - b[k] as i32).unsigned_abs()).max().unwrap_or(0)).collect();
@@ -519,6 +671,7 @@ fn gpu_draws_yuv_alpha_plane_like_the_cpu() {
             height: h,
             layers: vec![PlanLayer { frame: background.clone(), matrix: Affine::IDENTITY, opacity: 1.0, blend: Blend::Normal, fx: None }],
         })
+        .unwrap()
         .over_black_rgba8();
         let (l, r, b0) = (at(&gpu, 1), at(&gpu, w - 2), at(&bg, 1));
         assert!((l.0 as i32 - b0.0 as i32).abs() <= 6 && (l.1 as i32 - b0.1 as i32).abs() <= 6, "{bits}-bit: left edge {l:?} vs background {b0:?}");

@@ -163,7 +163,7 @@ fn collect_needs(
             let (mut start, mut end) = ((lo - opts.handles).max(Tick::ZERO), hi + opts.handles);
             match project.item(item).map(|i| &i.kind) {
                 Some(ItemKind::Media(m)) => {
-                    let Some(a) = m.info.audio.as_ref() else { continue };
+                    let Some(a) = m.info.audio() else { continue };
                     let path = match &m.media {
                         MediaRef::File { path } => Some(path.clone()),
                         MediaRef::Generator(_) => None,

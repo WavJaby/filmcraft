@@ -6,7 +6,7 @@ fn invalid_preview_scales_are_rejected_without_allocating() {
     s.execute("file.newSequence", serde_json::json!({"width":160,"height":90})).unwrap();
     for scale in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::MAX] {
         assert!(s.render_program(scale).is_none());
-        assert!(s.render_program_working(scale).is_none());
+        assert!(s.render_program_working(scale).is_err());
     }
     assert!(s.try_render_program_at(f32::NAN, Tick::ZERO).unwrap_err().to_string().contains("finite"), "the reason is reported");
     assert_eq!(s.render_program(0.5).unwrap().w, 80);
@@ -144,6 +144,73 @@ fn sequence_parameters_are_bounded_and_failed_changes_are_atomic() {
     assert_eq!(s.active_sequence().unwrap().settings.height, 8192, "a 16384x8192 panorama is accepted");
 }
 
+/// The first video clip's Motion Position and Scale (static values).
+fn first_motion(s: &Session) -> (u64, (f64, f64), f64) {
+    let q = s.active_sequence().unwrap();
+    let it = q.video_tracks.iter().flat_map(|t| &t.items).find(|i| i.effect("motion").is_some()).unwrap();
+    let m = it.effect("motion").unwrap();
+    let p = match m.param("position").unwrap().value {
+        filmcraft_project::ParamValue::Vec2(v) => (v.x, v.y),
+        _ => panic!("position is a point"),
+    };
+    let sc = match m.param("scale").unwrap().value {
+        filmcraft_project::ParamValue::Float(v) => v,
+        _ => panic!("scale is a number"),
+    };
+    (it.id.0, p, sc)
+}
+
+#[test]
+fn sequence_settings_scales_motion_with_the_frame_size_in_one_undo_step() {
+    let mut s = demo();
+    let before = (*s.project).clone();
+    let (id, p0, s0) = first_motion(&s);
+    assert_eq!((s.active_sequence().unwrap().settings.width, s.active_sequence().unwrap().settings.height), (1920, 1080));
+    let r = s.execute("sequence.settings", json!({"width":1280,"height":720,"scaleMotion":true})).unwrap();
+    assert!(r["scaledClips"].as_u64().unwrap() >= 1, "{r}");
+    let (id1, p1, s1) = first_motion(&s);
+    assert_eq!(id1, id);
+    assert!((p1.0 - p0.0 * 2.0 / 3.0).abs() < 1e-9 && (p1.1 - p0.1 * 2.0 / 3.0).abs() < 1e-9, "{p0:?} -> {p1:?}");
+    assert!((s1 - s0 * 2.0 / 3.0).abs() < 1e-9, "{s0} -> {s1}");
+    let after = (*s.project).clone();
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(*s.project, before, "size and Motion come back in one undo step");
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(*s.project, after);
+    // without the option the frame size changes alone (the command's default, as before)
+    let r = s.execute("sequence.settings", json!({"width":3840,"height":2160})).unwrap();
+    assert_eq!(r["scaledClips"], json!(0));
+    assert_eq!(first_motion(&s), (id, p1, s1));
+    assert_eq!(s.active_sequence().unwrap().settings.width, 3840);
+}
+
+#[test]
+fn sequence_settings_timecode_render_quality_and_colour() {
+    let mut s = demo();
+    s.execute("sequence.settings", json!({"fps":29.97,"dropFrame":true,"maxRenderQuality":true})).unwrap();
+    let st = s.active_sequence().unwrap().settings.clone();
+    assert_eq!(st.frame_rate, FrameRate::FPS_29_97);
+    assert!(st.drop_frame && st.max_render_quality);
+    s.execute("sequence.settings", json!({"dropFrame":false})).unwrap();
+    assert!(!s.active_sequence().unwrap().settings.drop_frame);
+    // drop-frame only exists for the NTSC rates; a refused change leaves everything as it was
+    let before = (*s.project).clone();
+    let history = s.history.undo.len();
+    for params in [json!({"fps":25,"dropFrame":true}), json!({"workingSpace":"rec2020-log"}), json!({"fps":25,"dropFrame":true,"width":1280})] {
+        assert!(s.execute("sequence.settings", params.clone()).is_err(), "{params}");
+        assert_eq!(*s.project, before, "{params}");
+        assert_eq!(s.history.undo.len(), history);
+    }
+    s.execute("sequence.settings", json!({"workingSpace":"rec2100-pq","wideGamut":true,"autoToneMap":true})).unwrap();
+    let st = s.active_sequence().unwrap().settings.clone();
+    assert_eq!(st.color.working, filmcraft_color::WorkingSpace::Rec2100Pq);
+    assert!(st.color.wide_gamut && st.color.auto_tone_map);
+    assert_eq!(st.working_space, "Rec. 2100 PQ");
+    // disabled without a sequence
+    let mut empty = Session::default();
+    assert!(empty.execute("sequence.settings", json!({"width":1280})).is_err());
+}
+
 #[test]
 fn zero_fps_is_refused() {
     let mut s = demo();
@@ -168,6 +235,51 @@ fn effects_and_keyframes() {
     s.execute("effects.toggleAnimation", json!({"clip": c, "effect": "motion", "param": "scale"})).unwrap();
     let it = s.active_sequence().unwrap().find_item(filmcraft_project::ClipId(c)).unwrap().1.clone();
     assert!(it.effect("motion").unwrap().params["scale"].is_animated());
+}
+
+/// `effects.addKeyframe` is the keyframe diamond of Effect Controls and Properties: it adds a
+/// keyframe at the playhead or removes the one there, and the value then follows the keyframes
+/// that are left (Premiere's Add/Remove Keyframe), unlike the stopwatch, which drops them all.
+#[test]
+fn add_keyframe_toggles_the_keyframe_at_the_playhead() {
+    let mut s = demo();
+    let c = s.active_sequence().unwrap().video_tracks[0].items[0].id.0;
+    let scale = |s: &Session| {
+        let it = s.active_sequence().unwrap().find_item(filmcraft_project::ClipId(c)).unwrap().1;
+        let p = &it.effect("motion").unwrap().params["scale"];
+        (p.keyframes.len(), p.f64_at(it.source_time_at(s.playhead())))
+    };
+    let key = json!({"clip": c, "effect": "motion", "param": "scale"});
+    s.execute("playhead.set", json!({"seconds": 0.5})).unwrap();
+    s.execute("effects.addKeyframe", key.clone()).unwrap();
+    assert_eq!(scale(&s), (1, 100.0), "the first keyframe turns animation on");
+    s.execute("playhead.set", json!({"seconds": 2.5})).unwrap();
+    s.execute("effects.addKeyframe", key.clone()).unwrap();
+    s.execute("effects.setParam", json!({"clip": c, "effect": "motion", "param": "scale", "value": 50.0})).unwrap();
+    assert_eq!(scale(&s), (2, 50.0));
+    // on a keyframe: only that keyframe goes, and Scale is the other keyframe's 100 again
+    s.execute("effects.addKeyframe", key.clone()).unwrap();
+    assert_eq!(scale(&s), (1, 100.0));
+    s.undo();
+    assert_eq!(scale(&s), (2, 50.0));
+    s.redo();
+    assert_eq!(scale(&s), (1, 100.0));
+    // parameters that name nothing are errors and change nothing
+    for bad in [
+        json!({}),
+        json!({"clip": c}),
+        json!({"clip": u64::MAX, "param": "scale"}),
+        json!({"clip": c, "effect": "nope", "param": "scale"}),
+        json!({"clip": c, "effect": u64::MAX, "param": "scale"}),
+        json!({"clip": c, "effect": "motion", "param": "nope"}),
+        json!({"clip": c, "effect": "motion", "param": "scale", "mask": 7}),
+    ] {
+        assert!(s.execute("effects.addKeyframe", bad.clone()).is_err(), "{bad}");
+    }
+    assert_eq!(scale(&s), (1, 100.0));
+    // the stopwatch ends the animation and keeps the value at the playhead
+    s.execute("effects.toggleAnimation", key).unwrap();
+    assert_eq!(scale(&s), (0, 100.0));
 }
 
 #[test]

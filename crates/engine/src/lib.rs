@@ -45,6 +45,7 @@ pub mod sequence_tools;
 pub mod settings;
 pub mod shortcut_presets;
 pub mod shortcuts;
+pub mod source_monitor;
 pub mod sync;
 pub mod transcript;
 pub mod trim;
@@ -553,10 +554,10 @@ impl Session {
         let Some(p) = self.persistence.as_mut() else { return };
         for ev in p.drain_events() {
             match ev {
-                autosave::WorkerEvent::SavedProject { path, revision } => {
-                    if self.path.as_deref() == Some(path.as_str()) && revision > self.saved_revision && revision <= self.revision {
-                        self.saved_revision = revision;
-                    }
+                autosave::WorkerEvent::SavedProject { path, revision }
+                    if self.path.as_deref() == Some(path.as_str()) && revision > self.saved_revision && revision <= self.revision =>
+                {
+                    self.saved_revision = revision;
                 }
                 autosave::WorkerEvent::Error(m) => {
                     self.log.push(panels::Level::Error, "autosave", m.clone());
@@ -937,11 +938,11 @@ impl Session {
 
     /// Render the active sequence at the playhead in its working colour space (HDR values kept;
     /// for scopes and analysis).
-    pub fn render_program_working(&self, scale: f32) -> Option<filmcraft_render::Image> {
-        let seq = self.renderable_sequence(scale).ok()?;
+    pub fn render_program_working(&self, scale: f32) -> Result<filmcraft_render::Image> {
+        let seq = self.renderable_sequence(scale)?;
         let provider = self.media.provider(self.project.clone(), self.services.clone());
         let opts = filmcraft_render::RenderOptions { scale, working_output: true, ..Default::default() };
-        Some(filmcraft_render::render_sequence(&self.project, seq, self.playhead(), opts, &provider))
+        filmcraft_render::render_sequence(&self.project, seq, self.playhead(), opts, &provider).map_err(EngineError::Other)
     }
 
     /// Render the active sequence at the playhead (CPU reference path).
@@ -962,7 +963,7 @@ impl Session {
         let t = self.sequence_rate().snap(t.max(Tick::ZERO));
         let provider = self.media.provider(self.project.clone(), self.services.clone());
         let opts = filmcraft_render::RenderOptions { scale, captions: true, ..Default::default() };
-        Ok(filmcraft_render::render_sequence(&self.project, seq, t, opts, &provider))
+        filmcraft_render::render_sequence(&self.project, seq, t, opts, &provider).map_err(EngineError::Other)
     }
 
     /// The active sequence, if a frame of it at `scale` is within the image size limits.
@@ -1021,6 +1022,8 @@ const MAX_SUBCLIP_CHAIN: usize = 16;
 mod aaf_omf_tests;
 #[cfg(test)]
 mod audio_effects_tests;
+#[cfg(test)]
+mod audio_placement_tests;
 #[cfg(test)]
 mod autosave_tests;
 #[cfg(test)]
@@ -1105,3 +1108,11 @@ mod trim_tests;
 mod vfx_tests;
 #[cfg(test)]
 mod voiceover_tests;
+
+#[cfg(test)]
+mod source_placement_tests;
+
+#[cfg(test)]
+mod frame_export_tests;
+#[cfg(test)]
+mod wasm_clock_tests;

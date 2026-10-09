@@ -493,6 +493,10 @@ pub enum AudioChannels {
 }
 
 /// A clip instance on a track.
+fn is_zero_stream(stream: &usize) -> bool {
+    *stream == 0
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrackItem {
     pub id: ClipId,
@@ -547,6 +551,9 @@ pub struct TrackItem {
     /// left/right). Empty = the first two channels (mono sources on both sides).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_channels: Vec<u16>,
+    /// Audio stream within the media container (0 = the primary stream).
+    #[serde(default, skip_serializing_if = "is_zero_stream")]
+    pub audio_stream: usize,
     /// Graphic clips: roll / crawl, responsive time and the template the graphic came from
     /// ([`GraphicMeta`]). Schema v12.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1526,6 +1533,7 @@ impl Project {
             hold_filters: false,
             field_options: None,
             source_channels,
+            audio_stream: 0,
             graphic: source_graphic.and_then(|sg| sg.meta.map(Box::new)),
         })
     }

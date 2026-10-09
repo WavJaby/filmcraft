@@ -109,6 +109,28 @@ fn image_sequences_are_numbered_like_premiere() {
     }
 }
 
+/// `alpha` keeps straight alpha in PNG and TIFF sequences; off (the default) flattens over black (#160).
+#[test]
+fn image_sequences_keep_alpha_when_asked() {
+    let (p, seq, m) = matte([0.0, 0.0, 1.0, 0.5], 64, 36, None);
+    for (fmt, ext) in [(Format::PngSequence, "png"), (Format::TiffSequence, "tif")] {
+        for alpha in [false, true] {
+            let dir = Scratch::new(&format!("alpha-{ext}-{alpha}"));
+            let mut s = ExportSettings { format: fmt, path: dir.path(&format!("a.{ext}")), alpha, ..Default::default() };
+            s.range = Some(TimeRange::new(Tick::ZERO, FrameRate::FPS_24.tick_of(2)));
+            export(&p, seq, &s, &m, &Progress::default()).unwrap();
+            let img = image::open(dir.0.join(format!("a000.{ext}"))).unwrap();
+            let px = img.to_rgba8().get_pixel(32, 18).0;
+            if alpha {
+                assert!(img.color().has_alpha(), "{fmt:?} must be written with an alpha channel");
+                assert!((100..=160).contains(&px[3]) && px[2] > 200 && px[0] < 15, "{fmt:?} straight alpha: {px:?}");
+            } else {
+                assert!(px[3] == 255 && px[2] > 100 && px[2] < 240 && px[0] < 15, "{fmt:?} flattened over black: {px:?}");
+            }
+        }
+    }
+}
+
 #[test]
 fn wav_and_aiff_audio_only() {
     let (p, seq, m) = matte([0.0, 0.0, 0.0, 1.0], 64, 36, Some(-6.0));
@@ -201,7 +223,7 @@ fn frame_size_rate_and_scaling() {
     let src = filmcraft_codecs::open_bytes("square.mp4", bytes).unwrap();
     let v = src.info().video.clone().unwrap();
     assert_eq!((v.width, v.height), (256, 256));
-    let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 2))).unwrap().to_rgba8();
+    let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 2))).unwrap().to_rgba8().unwrap();
     let at = |x: usize, y: usize| &f[(y * 256 + x) * 4..(y * 256 + x) * 4 + 3];
     assert!(at(128, 128)[0] > 200, "picture in the middle: {:?}", at(128, 128));
     assert!(at(128, 10)[0] < 40, "letterbox bar on top: {:?}", at(128, 10));
@@ -225,7 +247,7 @@ fn frame_size_rate_and_scaling() {
     export(&p, seq, &s, &m, &Progress::default()).unwrap();
     let bytes: Arc<[u8]> = std::fs::read(&path).unwrap().into();
     let src = filmcraft_codecs::open_bytes("fill.mov", bytes).unwrap();
-    let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 2))).unwrap().to_rgba8();
+    let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 2))).unwrap().to_rgba8().unwrap();
     assert!(f[(5 * 200 + 100) * 4] > 200, "filled to the top edge");
 }
 
@@ -297,7 +319,7 @@ fn two_pass_and_cbr_h264() {
         assert_eq!(prog.done.load(Ordering::Relaxed), 24 * passes);
         let bytes: Arc<[u8]> = std::fs::read(&path).unwrap().into();
         let src = filmcraft_codecs::open_bytes("x.mp4", bytes).unwrap();
-        let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 2))).unwrap().to_rgba8();
+        let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 2))).unwrap().to_rgba8().unwrap();
         assert!((f[2] as i32 - 204).abs() < 12 && (f[1] as i32 - 127).abs() < 12, "{mode:?}: {:?}", &f[..4]);
     }
 }

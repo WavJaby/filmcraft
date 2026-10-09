@@ -163,6 +163,10 @@ impl Display {
 
     /// Show the exact frame, or the nearest earlier cached one; returns whether it was exact.
     fn refresh(&mut self, server: &FrameServer, key: FrameKey) -> bool {
+        if let Some(error) = server.take_error() {
+            eprintln!("Playback benchmark failed: {error}");
+            std::process::exit(1);
+        }
         let (c0, t0) = (thread_cpu_time().unwrap_or_default(), Instant::now());
         let exact;
         let mut presented = false;
@@ -173,7 +177,10 @@ impl Display {
                 && self.last != Some(k)
             {
                 let before = comp.uploaded_bytes;
-                let _ = comp.composite_prepared(&plan.plan, Some(&plan.prepared));
+                if let Err(error) = comp.composite_prepared(&plan.plan, Some(&plan.prepared)) {
+                    server.reject_plan(k, error);
+                    return false;
+                }
                 // Wait for the GPU so the time includes the upload and the draw.
                 let _ = dev.poll(eframe::wgpu::PollType::wait_indefinitely());
                 self.uploaded += comp.uploaded_bytes - before;

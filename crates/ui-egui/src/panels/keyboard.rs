@@ -178,8 +178,20 @@ pub fn route(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, params: &Val
             v.pan = [0.0, 0.0];
             Ok(json!({"zoom": v.zoom}))
         }
-        "playback.inToOutPreroll" => play_range(app, true),
-        "playback.toOut" => play_range(app, false),
+        "playback.inToOutPreroll" => {
+            if crate::menus::targets_source(app, params) {
+                app.play_source_range(false, true).map(|_| Value::Null)
+            } else {
+                play_range(app, true)
+            }
+        }
+        "playback.toOut" => {
+            if crate::menus::targets_source(app, params) {
+                app.play_source_range(true, false).map(|_| Value::Null)
+            } else {
+                play_range(app, false)
+            }
+        }
         "timeline.expandAllTracks" | "timeline.minimizeAllTracks" => Ok(all_heights(app, id == "timeline.expandAllTracks")),
         "timeline.increaseVideoHeight" | "timeline.decreaseVideoHeight" | "timeline.increaseAudioHeight" | "timeline.decreaseAudioHeight" => {
             let d = if id.contains("increase") { HEIGHT_STEP } else { -HEIGHT_STEP };

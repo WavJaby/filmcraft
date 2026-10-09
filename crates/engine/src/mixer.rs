@@ -1129,19 +1129,19 @@ pub fn audio_gain(s: &mut Session, p: &Value) -> Result<Value> {
         }
         m => return Err(bad("clip.audioGain", format!("unknown mode `{m}` (set, adjust, normalizeMax, normalizeAll)"))),
     };
-    let n = new_gain.len();
-    let applied = new_gain.clone();
-    s.edit_sequence("Audio Gain", move |q, _, _| {
+    let applied = s.edit_sequence("Audio Gain", move |q, _, _| {
+        let mut applied = Vec::new();
         for t in q.audio_tracks.iter_mut() {
             for i in t.items.iter_mut() {
                 if let Some((_, g)) = new_gain.iter().find(|(c, _)| *c == i.id) {
                     i.gain_db = g.clamp(-96.0, 96.0);
+                    applied.push((i.id, i.gain_db));
                 }
             }
         }
-        Ok(())
+        Ok(applied)
     })?;
-    Ok(json!({"mode": mode, "clips": n, "gainDb": applied.iter().map(|(c, g)| json!({"clip": c.0, "gainDb": g})).collect::<Vec<_>>()}))
+    Ok(json!({"mode": mode, "clips": applied.len(), "gainDb": applied.iter().map(|(c, g)| json!({"clip": c.0, "gainDb": g})).collect::<Vec<_>>()}))
 }
 
 /// Effects panel ▸ Set Selected as Default Transition (video or audio, from the effect's kind).

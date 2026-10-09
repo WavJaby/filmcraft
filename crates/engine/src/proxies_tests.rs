@@ -40,7 +40,7 @@ fn create_attach_toggle_renders_the_same_picture() {
     let full_half = frame_rgba(&mut s, 5, 0.5);
     let r = s.execute("media.createProxies", json!({"items": [items[0].0], "preset": "prores_proxy_half", "wait": true})).unwrap();
     let out = r["outputs"][0]["path"].as_str().unwrap().to_string();
-    assert!(out.ends_with("Proxies/a_Proxy.mov"), "{out}");
+    assert!(std::path::Path::new(&out).ends_with(std::path::Path::new("Proxies").join("a_Proxy.mov")), "{out}");
     let job = s.execute("jobs.list", json!({})).unwrap();
     assert_eq!(job[0]["finished"], json!(true), "{job}");
     let m = s.project.item(items[0]).unwrap().as_media().unwrap().clone();
@@ -222,7 +222,7 @@ fn render_previews_ignore_proxies() {
     s.execute("sequence.renderInToOut", json!({"wait": true})).unwrap();
     let seq = s.state.active_sequence.unwrap();
     let f = s.previews.frame(&s.media, &s.project, seq, 4, 1.0).expect("frame 4 has a preview");
-    let q = psnr(&f.to_rgba8(), &full.2);
+    let q = psnr(&f.to_rgba8().unwrap(), &full.2);
     assert!(q > 30.0, "preview rendered from full-resolution media, not the (different) proxy: {q:.1} dB");
     let _ = std::fs::remove_dir_all(&root);
 }

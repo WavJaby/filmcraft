@@ -166,6 +166,9 @@ Notes:
 
 Every command is also one shell call away. Options go anywhere; output is JSON; exit status is 0 on
 success, 1 when a command fails and 2 on a usage error. `filmcraft-cli help` prints the reference.
+If the reader of stdout closes the pipe early (`filmcraft-cli commands | head`), the CLI drops the rest
+of its output but still finishes the work, saves included, and the exit status still reports
+failures; any other stdout write error is reported and makes the status 1.
 
 ```sh
 filmcraft-cli commands razor                     # find ids (add --json for machine output)

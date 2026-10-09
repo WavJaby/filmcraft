@@ -58,7 +58,7 @@ fn mjpeg_mov_with_pcm() {
     assert_eq!(info.video.as_ref().unwrap().width, 320);
     assert_eq!(info.video.as_ref().unwrap().frame_rate, filmcraft_time::FrameRate::FPS_24);
     let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND))).unwrap();
-    let px = f.to_rgba8();
+    let px = f.to_rgba8().unwrap();
     let c = &px[(120 * 320 + 160) * 4..][..3];
     assert!(c[0] > 230 && c[1] < 30 && c[2] < 30, "{c:?}");
     let a = src.audio(0, 4800, 48_000).unwrap();
@@ -70,7 +70,7 @@ fn mjpeg_mov_with_pcm() {
 fn aac_mp4_decodes() {
     let Some(b) = fixture("tone_aac.mp4", &["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:d=3", "-c:a", "aac", "-b:a", "128k"]) else { return };
     let src = crate::open_bytes("tone_aac.mp4", b).unwrap();
-    assert!(src.info().audio.as_ref().unwrap().codec.contains("AAC"));
+    assert!(src.info().audio().unwrap().codec.contains("AAC"));
     // read in the middle (random access) and sequentially
     let a = src.audio(48_000, 4800, 48_000).unwrap();
     let p = a.peaks()[0];
@@ -123,8 +123,8 @@ fn seek_backwards_and_forwards_mjpeg() {
     let a = src.video_frame(FrameRequest::full(rate.tick_of(60))).unwrap();
     let b = src.video_frame(FrameRequest::full(rate.tick_of(10))).unwrap();
     let c = src.video_frame(FrameRequest::full(rate.tick_of(60))).unwrap();
-    assert_eq!(a.to_rgba8(), c.to_rgba8());
-    assert_ne!(a.to_rgba8(), b.to_rgba8());
+    assert_eq!(a.to_rgba8().unwrap(), c.to_rgba8().unwrap());
+    assert_ne!(a.to_rgba8().unwrap(), b.to_rgba8().unwrap());
 }
 
 #[test]
@@ -142,8 +142,8 @@ fn h264_mp4_decodes_and_seeks() {
     assert_eq!((late.width, late.height), (640, 360));
     let early = src.video_frame(FrameRequest::full(rate.tick_of(3))).unwrap();
     let again = src.video_frame(FrameRequest::full(rate.tick_of(70))).unwrap();
-    assert_eq!(late.to_rgba8(), again.to_rgba8(), "random access is deterministic");
-    assert_ne!(late.to_rgba8(), early.to_rgba8());
+    assert_eq!(late.to_rgba8().unwrap(), again.to_rgba8().unwrap(), "random access is deterministic");
+    assert_ne!(late.to_rgba8().unwrap(), early.to_rgba8().unwrap());
     // sequential access after a seek
     for f in 71..90 {
         src.video_frame(FrameRequest::full(rate.tick_of(f))).unwrap();
@@ -157,7 +157,7 @@ fn prores_mov_decodes() {
     assert!(src.info().video.as_ref().unwrap().codec.contains("ProRes"));
     let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 2))).unwrap();
     assert!(f.format_label().contains("4:2:2"));
-    let px = f.to_rgba8();
+    let px = f.to_rgba8().unwrap();
     // leftmost bars area is 40% grey
     let c = &px[(100 * 640 + 20) * 4..][..3];
     assert!((c[0] as i32 - 104).abs() < 6, "{c:?}");
@@ -179,7 +179,7 @@ fn dnxhd_and_dnxhr_movs_decode() {
         let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 10))).unwrap();
         assert!(f.format_label().contains(fmt), "{}", f.format_label());
         let w = f.width as usize;
-        let px = f.to_rgba8();
+        let px = f.to_rgba8().unwrap();
         // leftmost bars area is 40% grey
         let c = &px[(100 * w + 20) * 4..][..3];
         assert!((c[0] as i32 - 104).abs() < 6, "{name}: {c:?}");
@@ -203,7 +203,7 @@ fn check_mkv(name: &str, vcodec: &[&str], acodec: &[&str]) {
     assert!((d - 2.0).abs() < 0.1, "duration {d}");
     for secs in [0.0, 1.24, 0.4] {
         let f = src.video_frame(FrameRequest { time: Tick((secs * TICKS_PER_SECOND as f64) as i64), scale: 1.0 }).expect("frame");
-        let rgba = f.to_rgba8();
+        let rgba = f.to_rgba8().unwrap();
         let px = &rgba[(120 * 320 + 160) * 4..][..3];
         for (got, want) in px.iter().zip([0x30u8, 0x60, 0xc0]) {
             assert!((*got as i32 - want as i32).abs() <= 6, "{name} at {secs}s: {px:?}");
@@ -448,7 +448,7 @@ fn mkv_vp9_rgb() {
     };
     let src = crate::open_bytes("orange_vp9_gbrp.mkv", b).unwrap();
     let f = src.video_frame(FrameRequest::full(Tick(TICKS_PER_SECOND / 5))).unwrap();
-    let px = f.to_rgba8();
+    let px = f.to_rgba8().unwrap();
     let c = &px[(48 * 128 + 64) * 4..][..3];
     // (the lavfi colour source is converted to RGB by ffmpeg, which rounds by a level)
     for (got, want) in c.iter().zip([0xe0u8, 0x80, 0x20]) {
@@ -510,7 +510,7 @@ fn check_opus(name: &str, channels: usize, expr: &str, extra: &[&str], container
     let src = crate::open_bytes(name, b).expect("open");
     let info = src.info().clone();
     assert_eq!(info.container, container);
-    let a = info.audio.as_ref().expect("audio");
+    let a = info.audio().expect("audio");
     assert_eq!((a.codec.as_str(), a.sample_rate, a.channels as usize), ("Opus", 48_000, channels));
     let d = info.duration.seconds();
     assert!((d - 3.0).abs() < 0.03, "{name}: duration {d}");
@@ -613,5 +613,5 @@ fn apv_mp4_and_raw_bitstream_decode() {
     assert_eq!(mp4_v.codec, "APV 422-10");
     assert_eq!(mp4_v.pixel_format, "YUV 4:2:2 10-bit");
     let decoded_mp4 = mp4_src.video_frame(FrameRequest::full(Tick::ZERO)).expect("decode mp4 frame");
-    assert_eq!(decoded_mp4.to_rgba8(), decoded_raw.to_rgba8());
+    assert_eq!(decoded_mp4.to_rgba8().unwrap(), decoded_raw.to_rgba8().unwrap());
 }

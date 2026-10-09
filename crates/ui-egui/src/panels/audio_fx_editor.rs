@@ -172,8 +172,8 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             close.push(target);
             continue;
         }
-        let name = inst.def().map(|d| d.name).unwrap_or("Effect");
-        let kind = if matches!(target, FxTarget::Clip { .. }) { "Clip Fx Editor" } else { "Track Fx Editor" };
+        let name = inst.def().map_or(tl!("Effect"), |d| crate::i18n::t(d.name));
+        let kind = if matches!(target, FxTarget::Clip { .. }) { tl!("Clip Fx Editor") } else { tl!("Track Fx Editor") };
         let title = format!("{kind} - {name}: {place}");
         let k = key(&target);
         let drafts_id = egui::Id::new(("fx-editor-drafts", &k));
@@ -191,7 +191,7 @@ pub fn show(app: &mut FilmcraftApp, ctx: &egui::Context) {
             }
             ui.separator();
             ui.horizontal(|ui| {
-                let r = ui.button("Close");
+                let r = ui.button(tl!("Close"));
                 ed.auto(format!("fxEditor.{}.close", ed.fx), r.rect, "Close");
                 if r.clicked() {
                     closed = true;
@@ -349,7 +349,7 @@ fn parametric(ui: &mut egui::Ui, ed: &mut Ed) {
             ed.toggle(ui, &format!("{pre}_on"), label);
         }
     });
-    ed.slider(ui, "master_gain", "Master Gain", false);
+    ed.slider(ui, "master_gain", tl!("Master Gain"), false);
 }
 
 // --------------------------------------------------------------------------- graphic EQ
@@ -401,8 +401,8 @@ fn graphic(ui: &mut egui::Ui, ed: &mut Ed) {
         }
     }
     ui.horizontal(|ui| {
-        ed.slider(ui, "gain", "Master Gain", false);
-        let r = ui.button("Reset");
+        ed.slider(ui, "gain", tl!("Master Gain"), false);
+        let r = ui.button(tl!("Reset"));
         ed.auto(format!("fxEditor.{}.reset", ed.fx), r.rect, "Reset");
         if r.clicked() {
             for i in 0..n {
@@ -437,8 +437,8 @@ fn transfer_plot(ui: &mut egui::Ui, ed: &mut Ed, size: f32, band: usize, auto: S
             .collect();
         p.add(egui::Shape::line(pts, Stroke::new(1.5, Color32::from_rgb(0xff, 0xb3, 0x47))));
     }
-    p.text(r.left_top() + vec2(3.0, 2.0), Align2::LEFT_TOP, "out", Tokens::ui(8.5), ed.t.text_faint);
-    p.text(r.right_bottom() - vec2(3.0, 2.0), Align2::RIGHT_BOTTOM, "in", Tokens::ui(8.5), ed.t.text_faint);
+    p.text(r.left_top() + vec2(3.0, 2.0), Align2::LEFT_TOP, tl!("out"), Tokens::ui(8.5), ed.t.text_faint);
+    p.text(r.right_bottom() - vec2(3.0, 2.0), Align2::RIGHT_BOTTOM, tl!("in"), Tokens::ui(8.5), ed.t.text_faint);
     ed.auto(auto, r, "Transfer curve");
 }
 
@@ -455,7 +455,7 @@ fn multiband(ui: &mut egui::Ui, ed: &mut Ed) {
     for b in 0..4 {
         let br = Rect::from_min_max(pos2(edges[b], r.min.y), pos2(edges[b + 1], r.max.y));
         ui.painter().rect_filled(br.shrink2(vec2(0.0, 8.0)), 0.0, cols[b].gamma_multiply(0.35));
-        ui.painter().text(br.center(), Align2::CENTER_CENTER, format!("Band {}", b + 1), Tokens::ui(10.0), ed.t.text);
+        ui.painter().text(br.center(), Align2::CENTER_CENTER, tlf!("Band {n}", n = b + 1), Tokens::ui(10.0), ed.t.text);
     }
     for (k, pid) in ["xo1", "xo2", "xo3"].iter().enumerate() {
         let x = edges[k + 1];
@@ -480,29 +480,29 @@ fn multiband(ui: &mut egui::Ui, ed: &mut Ed) {
         for b in 1..=4 {
             ui.vertical(|ui| {
                 ui.set_width(150.0);
-                ui.label(egui::RichText::new(format!("Band {b}")).strong());
+                ui.label(egui::RichText::new(tlf!("Band {n}", n = b)).strong());
                 transfer_plot(ui, ed, 110.0, b - 1, format!("fxEditor.{}.curve.{b}", ed.fx));
                 ui.horizontal(|ui| {
-                    ed.toggle(ui, &format!("b{b}_solo"), "Solo");
-                    ed.toggle(ui, &format!("b{b}_bypass"), "Bypass");
+                    ed.toggle(ui, &format!("b{b}_solo"), tl!("Solo"));
+                    ed.toggle(ui, &format!("b{b}_bypass"), tl!("Bypass"));
                 });
-                ed.slider(ui, &format!("b{b}_threshold"), "Thr", false);
-                ed.slider(ui, &format!("b{b}_ratio"), "Ratio", false);
-                ed.slider(ui, &format!("b{b}_attack"), "Att", true);
-                ed.slider(ui, &format!("b{b}_release"), "Rel", true);
-                ed.slider(ui, &format!("b{b}_gain"), "Gain", false);
+                ed.slider(ui, &format!("b{b}_threshold"), tl!("Thr"), false);
+                ed.slider(ui, &format!("b{b}_ratio"), tl!("Ratio"), false);
+                ed.slider(ui, &format!("b{b}_attack"), tl!("Att"), true);
+                ed.slider(ui, &format!("b{b}_release"), tl!("Rel"), true);
+                ed.slider(ui, &format!("b{b}_gain"), tl!("Gain"), false);
             });
         }
     });
     ui.separator();
     ui.horizontal(|ui| {
-        ed.slider(ui, "output", "Output Gain", false);
-        ed.toggle(ui, "lim_on", "Limiter");
-        ed.toggle(ui, "link", "Link Channels");
+        ed.slider(ui, "output", tl!("Output Gain"), false);
+        ed.toggle(ui, "lim_on", tl!("Limiter"));
+        ed.toggle(ui, "link", tl!("Link Channels"));
     });
     ui.horizontal(|ui| {
-        ed.slider(ui, "lim_threshold", "Limiter Threshold", false);
-        ed.slider(ui, "lim_release", "Limiter Release", true);
+        ed.slider(ui, "lim_threshold", tl!("Limiter Threshold"), false);
+        ed.slider(ui, "lim_release", tl!("Limiter Release"), true);
     });
 }
 
@@ -513,34 +513,34 @@ fn dynamics(ui: &mut egui::Ui, ed: &mut Ed) {
         transfer_plot(ui, ed, 220.0, 0, format!("fxEditor.{}.curve", ed.fx));
         ui.vertical(|ui| {
             ui.set_width(330.0);
-            ed.toggle(ui, "gate_on", "Auto Gate");
-            ed.slider(ui, "gate_threshold", "Threshold", false);
-            ed.slider(ui, "gate_attack", "Attack", true);
-            ed.slider(ui, "gate_release", "Release", true);
-            ed.slider(ui, "gate_hold", "Hold", false);
+            ed.toggle(ui, "gate_on", tl!("Auto Gate"));
+            ed.slider(ui, "gate_threshold", tl!("Threshold"), false);
+            ed.slider(ui, "gate_attack", tl!("Attack"), true);
+            ed.slider(ui, "gate_release", tl!("Release"), true);
+            ed.slider(ui, "gate_hold", tl!("Hold"), false);
             ui.separator();
-            ed.toggle(ui, "comp_on", "Compressor");
-            ed.slider(ui, "comp_threshold", "Threshold", false);
-            ed.slider(ui, "comp_ratio", "Ratio", false);
-            ed.slider(ui, "comp_attack", "Attack", true);
-            ed.slider(ui, "comp_release", "Release", true);
+            ed.toggle(ui, "comp_on", tl!("Compressor"));
+            ed.slider(ui, "comp_threshold", tl!("Threshold"), false);
+            ed.slider(ui, "comp_ratio", tl!("Ratio"), false);
+            ed.slider(ui, "comp_attack", tl!("Attack"), true);
+            ed.slider(ui, "comp_release", tl!("Release"), true);
             ui.horizontal(|ui| {
-                ed.toggle(ui, "comp_auto", "Auto Makeup");
+                ed.toggle(ui, "comp_auto", tl!("Auto Makeup"));
             });
-            ed.slider(ui, "comp_makeup", "Makeup", false);
+            ed.slider(ui, "comp_makeup", tl!("Makeup"), false);
         });
         ui.vertical(|ui| {
             ui.set_width(330.0);
-            ed.toggle(ui, "exp_on", "Expander");
-            ed.slider(ui, "exp_threshold", "Threshold", false);
-            ed.slider(ui, "exp_ratio", "Ratio", false);
+            ed.toggle(ui, "exp_on", tl!("Expander"));
+            ed.slider(ui, "exp_threshold", tl!("Threshold"), false);
+            ed.slider(ui, "exp_ratio", tl!("Ratio"), false);
             ui.separator();
-            ed.toggle(ui, "lim_on", "Limiter");
-            ed.slider(ui, "lim_threshold", "Threshold", false);
-            ed.slider(ui, "lim_release", "Release", true);
-            ed.toggle(ui, "soft_clip", "Soft Clip");
+            ed.toggle(ui, "lim_on", tl!("Limiter"));
+            ed.slider(ui, "lim_threshold", tl!("Threshold"), false);
+            ed.slider(ui, "lim_release", tl!("Release"), true);
+            ed.toggle(ui, "soft_clip", tl!("Soft Clip"));
             ui.separator();
-            ed.slider(ui, "output", "Output Gain", false);
+            ed.slider(ui, "output", tl!("Output Gain"), false);
         });
     });
 }

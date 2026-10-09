@@ -224,11 +224,20 @@ impl FrameRate {
         (t.0 as i128 * r.num as i128).div_euclid(TICKS_PER_SECOND as i128 * r.den as i128) as i64
     }
 
-    /// Start tick of frame `f`.
+    /// Start tick of frame `f` (ceiling division).
+    ///
+    /// Uses ceiling (not floor) so that `frame_at(tick_of(f)) == f` holds for every
+    /// frame index, even when the frame duration is not an integer number of ticks
+    /// (exotic rates like 37.516 fps where `TICKS_PER_SECOND * den / num` has a
+    /// fractional remainder).  Floor division truncates the remainder, causing each
+    /// frame boundary to drift backward by one tick until `frame_at` returns `f - 1`
+    /// instead of `f` — frame stepping then stalls or moves backward.
+    /// Ceiling is correct because the frame duration is always > 1 tick, so
+    /// `floor(ceil(f·D) / D) == f` for every integer `f`.
     pub fn tick_of(self, f: i64) -> Tick {
         let r = self.sane();
         let n = f as i128 * TICKS_PER_SECOND as i128 * r.den as i128;
-        Tick(n.div_euclid(r.num as i128) as i64)
+        Tick((-(-n).div_euclid(r.num as i128)) as i64)
     }
 
     /// Snap `t` down to a frame boundary.
@@ -571,12 +580,101 @@ mod tests {
         assert_eq!(FrameRate::FPS_23_976.label(), "23.976");
     }
 
+    #[test]
+    fn exotic_frame_rate_roundtrip() {
+        // Issue #301: 37.516 fps footage.  The frame duration is
+        // 254_016_000_000 * 250 / 9379 = 6_770_871_094.999… ticks — not an
+        // integer.  Floor division in `tick_of` truncated to 6_770_871_094,
+        // losing ~1 tick/frame so `frame_at(tick_of(f))` returned `f - 1`.
+        // Ceiling division makes the round-trip exact for all integer frames.
+        let rates: &[(FrameRate, &str)] = &[
+            (FrameRate::from_f64(37.516), "37.516"),
+            (FrameRate::from_f64(37.5161), "37.5161"),
+            (FrameRate::from_f64(12.345), "12.345"),
+            (FrameRate::from_f64(59.9401), "59.9401"),
+            (FrameRate::from_f64(23.9761), "23.9761"),
+        ];
+        for &(r, name) in rates {
+            // Round-trip over a wide range including negatives.
+            let bad: Vec<i64> = (-20_000..20_000).filter(|&f| r.frame_at(r.tick_of(f)) != f).collect();
+            assert!(bad.is_empty(), "{name}: {} round-trip failures, first {bad:?}", r);
+
+            // snap(tick_of(f)) == tick_of(f): snapping a frame boundary is a no-op.
+            for f in -100i64..100 {
+                assert_eq!(r.snap(r.tick_of(f)), r.tick_of(f), "{name}: snap(tick_of({f}))");
+            }
+
+            // Step-back: the last tick of frame f is one tick before tick_of(f+1),
+            // and frame_at of that is still f.  Also check the frame_duration path:
+            // frame_at(tick_of(f) - frame_duration()) == f - 1.
+            for f in 1..2000i64 {
+                let last_tick = r.tick_of(f + 1) - Tick(1);
+                assert_eq!(r.frame_at(last_tick), f, "{name}: last tick of frame {f}");
+                let prev = r.tick_of(f) - r.frame_duration();
+                assert_eq!(r.frame_at(prev), f - 1, "{name}: tick_of({f}) - frame_duration");
+            }
+        }
+
+        // Stepping simulation: frame_at(playhead) + 1, tick_of, snap.
+        // Before the fix this stalled at frame 0 (step forward did nothing).
+        let r = FrameRate::from_f64(37.516);
+        let mut tick = Tick::ZERO;
+        for expected in 0..50 {
+            let frame = r.frame_at(tick);
+            assert_eq!(frame, expected, "stepping forward at frame {expected}");
+            tick = r.tick_of(frame + 1);
+            tick = r.snap(tick); // set_playhead calls snap
+        }
+
+        // Stepping backward from frame 50 should land on 49, 48, … 0
+        tick = r.tick_of(50);
+        let mut last = 50;
+        while last > 0 {
+            let frame = r.frame_at(tick);
+            let target = frame - 1;
+            if target < 0 {
+                break;
+            }
+            tick = r.snap(r.tick_of(target));
+            let landed = r.frame_at(tick);
+            assert_eq!(landed, target, "stepping backward to frame {target}");
+            last = landed;
+        }
+    }
+
+    #[test]
+    fn exotic_frame_rate_durations() {
+        // frame_duration uses floor (not round) so that `end - frame_duration()`
+        // lands on the previous frame, not two frames back, for exotic rates.
+        let r = FrameRate::from_f64(37.516);
+        // 254_016_000_000 * 250 / 9379 = 6_770_871_094.999… → floor = 6_770_871_094
+        assert_eq!(r.frame_duration().0, 6_770_871_094);
+
+        // Standard rates must remain exact (unchanged).
+        assert_eq!(FrameRate::FPS_23_976.frame_duration().0, 10_594_584_000);
+        assert_eq!(FrameRate::FPS_24.frame_duration().0, 10_584_000_000);
+        assert_eq!(FrameRate::FPS_25.frame_duration().0, 10_160_640_000);
+        assert_eq!(FrameRate::FPS_29_97.frame_duration().0, 8_475_667_200);
+        assert_eq!(FrameRate::FPS_30.frame_duration().0, 8_467_200_000);
+        assert_eq!(FrameRate::FPS_60.frame_duration().0, 4_233_600_000);
+    }
+
     proptest! {
         #[test]
         fn frame_tick_roundtrip(f in -1_000_000i64..10_000_000, ri in 0usize..11) {
             let r = FrameRate::COMMON[ri];
             prop_assert_eq!(r.frame_at(r.tick_of(f)), f);
             prop_assert_eq!(r.frame_at(r.tick_of(f) + r.frame_duration() - Tick(1)), f);
+        }
+
+        #[test]
+        fn exotic_frame_tick_roundtrip(f in -100_000i64..100_000, num in 1u64..200_000, den in 1u64..2_000) {
+            // Skip rates that divide evenly (those are covered by COMMON above).
+            let r = FrameRate::new(num as i64, den as i64);
+            if (TICKS_PER_SECOND as i128 * r.den as i128) % r.num as i128 == 0 {
+                return Ok(());
+            }
+            prop_assert_eq!(r.frame_at(r.tick_of(f)), f, "rate={}/{}, f={}", r.num, r.den, f);
         }
 
         #[test]

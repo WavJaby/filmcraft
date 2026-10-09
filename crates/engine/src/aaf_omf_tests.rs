@@ -69,7 +69,7 @@ fn aaf_embedded_trimmed_audio_round_trips_sample_exact() {
         assert_eq!(a, b, "{kind:?}");
     }
     // video links to the original movies, audio to WAV files extracted next to the AAF
-    assert_eq!(path_of(&s, q.video_tracks[0].items[0].item), path_of(&s, items[0]));
+    assert_eq!(std::path::Path::new(&path_of(&s, q.video_tracks[0].items[0].item)), std::path::Path::new(&path_of(&s, items[0])));
     for (c, oc) in q.audio_tracks[0].items.iter().zip(&orig.audio_tracks[0].items) {
         let p = path_of(&s, c.item);
         assert!(p.ends_with(".wav") && std::path::Path::new(&p).exists(), "{p}");
@@ -138,7 +138,7 @@ fn aaf_separate_aiff_breakout_and_linked() {
     let n = imported_seq(&r);
     let q = s.project.sequence(n).unwrap();
     let a = &q.audio_tracks[0].items[0];
-    assert_eq!(path_of(&s, a.item), path_of(&s, items[0]));
+    assert_eq!(std::path::Path::new(&path_of(&s, a.item)), std::path::Path::new(&path_of(&s, items[0])));
     assert_eq!(a.source_in, FrameRate::FPS_24.tick_of(12));
     assert!(!s.project.item(a.item).unwrap().as_media().unwrap().offline);
     let _ = std::fs::remove_dir_all(dir);
@@ -159,7 +159,7 @@ fn aaf_video_mixdown() {
     assert_eq!(q.video_tracks.iter().map(|t| t.items.len()).sum::<usize>(), 1);
     let v = &q.video_tracks[0].items[0];
     assert_eq!(v.duration, FrameRate::FPS_24.tick_of(48));
-    assert_eq!(path_of(&s, v.item), mov);
+    assert_eq!(std::path::Path::new(&path_of(&s, v.item)), std::path::Path::new(mov));
     let m = s.project.item(v.item).unwrap().as_media().unwrap();
     assert!(!m.offline);
     assert_eq!(m.info.video.as_ref().map(|v| (v.width, v.height)), Some((64, 36)));
@@ -284,7 +284,7 @@ fn aaf_keeps_a_nested_sequence_as_a_sequence() {
         let want: Vec<_> = orig.tracks(kind)[0].items.iter().map(|c| (c.start, c.duration)).collect();
         assert_eq!(got, want, "{kind:?}");
     }
-    assert_eq!(path_of(&s, n.video_tracks[0].items[0].item), path_of(&s, items[0]));
+    assert_eq!(std::path::Path::new(&path_of(&s, n.video_tracks[0].items[0].item)), std::path::Path::new(&path_of(&s, items[0])));
     for (c, oc) in n.audio_tracks[0].items.iter().zip(&orig.audio_tracks[0].items) {
         let p = path_of(&s, c.item);
         assert!(p.ends_with(".wav") && std::path::Path::new(&p).exists(), "{p}");

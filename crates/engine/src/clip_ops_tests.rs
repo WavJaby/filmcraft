@@ -261,7 +261,7 @@ fn new_sequence_from_clip_bin_from_selection_and_offline_file() {
         .unwrap();
     let it = s.project.item(ItemId(r["item"].as_u64().unwrap())).unwrap();
     let m = it.as_media().unwrap();
-    assert!(m.offline && m.info.audio.is_none() && m.info.video.is_some());
+    assert!(m.offline && !m.info.has_audio() && m.info.video.is_some());
     assert_eq!(m.info.duration, s.sequence_rate().snap_nearest(Tick(4 * TICKS_PER_SECOND)));
     assert_eq!(m.info.start_timecode, Some(3600 * 24));
     assert_eq!(it.metadata["Tape Name"], "A001");
@@ -372,7 +372,7 @@ fn modify_audio_channels_and_breakout_to_mono() {
     s.project = std::sync::Arc::new({
         let mut p = (*s.project).clone();
         if let Some(m) = p.item_mut(item_named(&s, "Bars and Tone")).and_then(|i| i.as_media_mut()) {
-            m.info.audio = None;
+            m.info.audio_streams.clear();
         }
         p
     });
@@ -557,7 +557,7 @@ fn extract_audio_writes_a_wav_and_imports_it() {
     let item = s.project.item(ItemId(e["item"].as_u64().unwrap())).unwrap();
     let m = item.as_media().unwrap();
     assert!(m.info.video.is_none());
-    assert_eq!(m.info.audio.as_ref().unwrap().channels, 2);
+    assert_eq!(m.info.audio().unwrap().channels, 2);
     let src_dur = s.project.item(forest).unwrap().duration();
     assert!((m.info.duration - src_dur).0.abs() < TICKS_PER_SECOND / 100, "same length");
     assert_eq!(s.project.root.parent_of(item.id), s.project.root.parent_of(forest));
@@ -847,7 +847,7 @@ fn color_matte_color_changes_and_undoes() {
     let matte = s.execute("file.newColorMatte", json!({"width": 64, "height": 36, "color": "#ff0000"})).unwrap()["item"].as_u64().unwrap();
     let px = |s: &Session| {
         let f = s.source(ItemId(matte)).unwrap().video_frame(filmcraft_media::FrameRequest::full(Tick::ZERO)).unwrap();
-        f.to_rgba8()[..3].to_vec()
+        f.to_rgba8().unwrap()[..3].to_vec()
     };
     assert_eq!(px(&s), [255, 0, 0]);
     let r = s.execute("project.matteColor", json!({"item": matte, "color": "#0000ff"})).unwrap();

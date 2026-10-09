@@ -35,6 +35,8 @@ jobs:
           "$RUNNER_TEMP/actionlint" -color
       - name: shellcheck
         run: shellcheck packaging/*.sh packaging/*/*.sh
+      - name: Linux tarball installer
+        run: python3 packaging/linux/test_install.py
       - name: PowerShell
         shell: pwsh
         run: |

@@ -485,6 +485,23 @@ fn queue_exports_several_sequences_and_ranges() {
 }
 
 #[test]
+fn queue_folder_paths_expand_home_and_take_either_separator() {
+    let mut s = demo();
+    let first = s.state.active_sequence.unwrap();
+    let second = s.execute("file.newSequence", json!({"name": "Second Cut", "width": 640, "height": 360, "fps": 25})).unwrap()["sequence"].as_u64().unwrap();
+    let preset = "Waveform Audio 48 kHz 16-bit";
+    // a folder that does not exist yet, named by a trailing `\`: each sequence keeps its own name
+    s.execute("export.queue.add", json!({"preset": preset, "path": "not-yet-made\\", "sequences": [first.0, second]})).unwrap();
+    let paths: Vec<String> = queue(&mut s).iter().map(|i| i["path"].as_str().unwrap().to_string()).collect();
+    assert!(paths.iter().any(|p| p.ends_with("Second Cut.wav")), "{paths:?}");
+    if let Some(home) = crate::media_browser::std_home_dir() {
+        s.execute("export.queue.add", json!({"preset": preset, "path": "~/Exports/", "sequence": first.0})).unwrap();
+        let last = queue(&mut s).last().unwrap()["path"].as_str().unwrap().to_string();
+        assert!(last.starts_with(&home), "{last}");
+    }
+}
+
+#[test]
 fn quick_export_uses_and_remembers_a_preset() {
     let mut s = demo();
     let dir = Scratch::new("quick");

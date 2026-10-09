@@ -76,7 +76,8 @@ fn moved_media_opens_offline_and_relinks_others_by_folder() {
     assert!(!s.offline.prompt);
     assert_eq!(frame_rgba(&mut s, 3, 1.0).2, online, "relinked media renders as before the move");
     let b_path = s.project.item(items[1]).unwrap().as_media().unwrap().media.clone();
-    assert_eq!(b_path, filmcraft_project::MediaRef::File { path: moved.join("b.mov").to_string_lossy().into_owned() });
+    let filmcraft_project::MediaRef::File { path: b_path } = b_path else { panic!("relinked media must remain file-based") };
+    assert_eq!(std::path::Path::new(&b_path), moved.join("b.mov"));
     // undo brings the old (missing) paths back, and the slate with them
     s.execute("edit.undo", json!({})).unwrap();
     assert!(psnr(&frame_rgba(&mut s, 3, 1.0).2, &slate) > 40.0);
@@ -176,4 +177,11 @@ fn reimport_clears_offline_list_after_path_resolves() {
     assert_eq!(frame_rgba(&mut s, 3, 1.0), online);
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn explicit_folder_remaps_normalize_both_prefixes_and_respect_boundaries() {
+    assert_eq!(apply_remap(r"C:\shoot\Media\a.mov", r"C:\shoot\Media\", r"D:\archive\Media\"), Some("D:/archive/Media/a.mov".into()));
+    assert_eq!(apply_remap("C:/shoot/Media/a.mov", r"C:\shoot\Media", r"D:\archive\Media"), Some("D:/archive/Media/a.mov".into()));
+    assert_eq!(apply_remap("C:/shoot/Media2/a.mov", r"C:\shoot\Media", r"D:\archive\Media"), None);
 }

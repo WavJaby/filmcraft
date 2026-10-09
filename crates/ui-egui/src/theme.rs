@@ -257,8 +257,8 @@ pub fn font_families() -> Vec<FontFamily> {
     vec![FontFamily::Proportional, FontFamily::Monospace, FontFamily::Name("semibold".into()), FontFamily::Name("medium".into())]
 }
 
-/// Install fonts (Inter, Inter SemiBold, JetBrains Mono, then the Japanese craft-fonts when built with
-/// `CRAFT_FONTS_DIR`) and egui visuals.
+/// Install the Latin UI fonts, Chinese fallback (craft-fonts or an installed face), Japanese
+/// craft-fonts and egui visuals. Document names keep their glyphs in every interface language.
 pub fn install(ctx: &egui::Context, t: &Tokens) {
     let mut fonts = FontDefinitions::default();
     fonts.font_data.insert("inter".into(), Arc::new(FontData::from_static(filmcraft_text::fonts::INTER_REGULAR)));
@@ -269,7 +269,10 @@ pub fn install(ctx: &egui::Context, t: &Tokens) {
     fonts.families.entry(FontFamily::Monospace).or_default().insert(0, "jbmono".into());
     fonts.families.insert(FontFamily::Name("semibold".into()), vec!["inter-semibold".into(), "inter".into()]);
     fonts.families.insert(FontFamily::Name("medium".into()), vec!["inter-medium".into(), "inter".into()]);
+    // Japanese before Chinese: the two share code points, and Japanese text must keep Japanese
+    // glyph forms; Chinese faces still cover the hanzi Japanese fonts lack
     add_craft_fonts(&mut fonts);
+    crate::cjk::install(&mut fonts);
     ctx.set_fonts(fonts);
     apply_visuals(ctx, t);
 }
@@ -359,6 +362,41 @@ mod tests {
         ctx
     }
 
+    /// Chinese media and track names must render even when the interface stays in English.
+    /// Compare the rasterized glyphs with the missing-glyph box, including custom weight families.
+    #[test]
+    fn chinese_names_render_in_every_theme_and_font_family() {
+        const CHINESE: &str = "中文旁白音乐声轨测试简体汉语繁體漢語车";
+        filmcraft_text::fonts::scan_system();
+        let available = filmcraft_text::fonts::all_faces()
+            .iter()
+            .any(|f| matches!(f.info.origin, "system" | filmcraft_text::fonts::CRAFT_ORIGIN) && CHINESE.chars().all(|c| f.has_char(c)));
+        if !available {
+            eprintln!("SKIPPED: no craft-fonts or installed Chinese font");
+            return;
+        }
+        let ctx = egui::Context::default();
+        for kind in [ThemeKind::Dark, ThemeKind::Medium, ThemeKind::Light] {
+            install(&ctx, &Tokens::for_kind(kind));
+            ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+            ctx.fonts_mut(|fonts| {
+                for family in font_families() {
+                    let font = FontId::new(13.0, family);
+                    let missing = fonts.layout_no_wrap("\u{fffd}".into(), font.clone(), Color32::WHITE);
+                    let missing_uv = missing.rows[0].glyphs[0].uv_rect;
+                    let names = fonts.layout_no_wrap(CHINESE.into(), font.clone(), Color32::WHITE);
+                    assert_eq!(names.rows.iter().map(|r| r.glyphs.len()).sum::<usize>(), CHINESE.chars().count());
+                    for glyph in names.rows.iter().flat_map(|r| &r.glyphs) {
+                        assert!(!glyph.uv_rect.is_nothing(), "empty {} in {font:?}", glyph.chr);
+                        assert_ne!(glyph.uv_rect, missing_uv, "missing {} in {kind:?} / {font:?}", glyph.chr);
+                    }
+                }
+            });
+        }
+        // the layouts above put glyphs in the atlas: take that update so it isn't dropped unapplied
+        ctx.run_ui(egui::RawInput::default(), |_| {}).textures_delta.clear();
+    }
+
     /// Built with craft-fonts: every font family ends with the Japanese faces (BIZ UDPGothic
     /// first), and Japanese text gets real glyphs, not the replacement box.
     #[test]
@@ -373,7 +411,8 @@ mod tests {
             for (family, stack) in &defs.families {
                 let first = stack.iter().position(|n| n.starts_with("craft:")).unwrap_or(stack.len());
                 assert!(first > 0 && stack[first..].iter().all(|n| n.starts_with("craft:")), "{family:?}: {stack:?}");
-                assert!(stack[first].starts_with("craft:BIZ UDPGothic"), "{family:?}: {stack:?}");
+                let first_japanese = stack.iter().find(|n| n.starts_with("craft:BIZ") || n.starts_with("craft:Shippori"));
+                assert!(first_japanese.is_some_and(|n| n.starts_with("craft:BIZ UDPGothic")), "{family:?}: {stack:?}");
             }
             for family in [FontFamily::Proportional, FontFamily::Monospace] {
                 let font = FontId::new(13.0, family);
@@ -389,12 +428,11 @@ mod tests {
         assert!(galley.size().x > 13.0 * 4.0, "{:?}", galley.size());
     }
 
-    /// Built without craft-fonts: the theme installs only the app's own fonts and Latin text
-    /// works as before.
+    /// Latin text keeps its UI faces, with or without craft-fonts and system Chinese fonts.
     #[test]
     fn works_without_craft_fonts() {
         let ctx = installed();
-        let n = filmcraft_text::fonts::craft_japanese().count();
+        let n = filmcraft_text::fonts::craft_japanese().count() + crate::cjk::craft_fonts().count();
         ctx.fonts_mut(|fonts| {
             let defs = fonts.definitions().clone();
             assert_eq!(defs.font_data.keys().filter(|k| k.starts_with("craft:")).count(), n);

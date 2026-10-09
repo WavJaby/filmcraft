@@ -443,7 +443,7 @@ impl Exporter<'_> {
             return Some(i);
         }
         let video = m.info.video.as_ref();
-        let audio = m.info.audio.as_ref();
+        let audio = m.info.audio();
         let still = m.info.kind == MediaKind::Still;
         match ckind {
             CKind::Picture if video.is_none() && !still => return None,

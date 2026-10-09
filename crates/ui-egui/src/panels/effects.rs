@@ -20,7 +20,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let sr = Rect::from_min_size(rect.min + vec2(8.0, 6.0), vec2(rect.width() - 16.0, 22.0));
     let mut child = ui.new_child(egui::UiBuilder::new().max_rect(sr));
     let mut q = app.ui.effects_search.clone();
-    crate::widgets::search_field(&mut child, &mut q, "Search effects", sr.width(), &t);
+    crate::widgets::search_field(&mut child, &mut q, tl!("Search effects"), sr.width(), &t);
     app.ui.effects_search = q.clone();
     let body = Rect::from_min_max(pos2(rect.min.x, sr.max.y + 6.0), rect.max);
     // wide panel: the tree on the left, the Lumetri Presets thumbnail grid on the right
@@ -31,7 +31,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     };
     let mut bui = ui.new_child(egui::UiBuilder::new().max_rect(body).id_salt("fx-body"));
     bui.set_clip_rect(body);
-    let filter = q.to_ascii_lowercase();
+    let filter = q.to_lowercase();
     let defs = filmcraft_project::effect_defs();
     // folder tree: top-level categories in Premiere's order
     let tops = filmcraft_project::vtransition::EFFECT_TOP_FOLDERS;
@@ -41,7 +41,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
     egui::ScrollArea::vertical().id_salt("fx-scroll").auto_shrink([false, false]).show(&mut bui, |ui| {
         for &top in tops {
             if top == "Presets" {
-                let any = filter.is_empty() || app.session.presets.all().iter().any(|p| p.name.to_ascii_lowercase().contains(&filter));
+                let any = app.session.presets.all().iter().any(|p| crate::i18n::matches_query(&p.name, &filter));
                 if any && folder_row(app, ui, top, 0, &filter) {
                     preset_action = crate::panels::presets::folder_rows(app, ui, &filter).or(preset_action.take());
                 }
@@ -53,11 +53,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                 }
                 continue;
             }
-            let mut items: Vec<_> = defs
-                .iter()
-                .filter(|d| d.category.first() == Some(&top))
-                .filter(|d| filter.is_empty() || d.name.to_ascii_lowercase().contains(&filter))
-                .collect();
+            let mut items: Vec<_> = defs.iter().filter(|d| d.category.first() == Some(&top)).filter(|d| crate::i18n::matches_query(d.name, &filter)).collect();
             // Premiere lists effect folders and effects alphabetically (obsolete ones last)
             if top == "Video Effects" || top == "Legacy" {
                 items.sort_by_key(|d| (d.category.get(1) == Some(&"Obsolete"), d.category.get(1).copied().unwrap_or(""), d.name.to_ascii_lowercase()));
@@ -99,7 +95,7 @@ pub fn show(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
                     } else {
                         ui.painter().text(icon_r.center(), Align2::CENTER_CENTER, "fx", Tokens::ui(8.0), t.text_dim);
                     }
-                    ui.painter().text(pos2(x, r.center().y), Align2::LEFT_CENTER, d.name, Tokens::ui(12.0), t.text);
+                    ui.painter().text(pos2(x, r.center().y), Align2::LEFT_CENTER, crate::i18n::t(d.name), Tokens::ui(12.0), t.text);
                     // badges: accelerated / 32-bit / YUV
                     let mut bx = r.max.x - 8.0;
                     for (on, label) in [(d.yuv, "YUV"), (d.float32, "32"), (d.accelerated, "⚡")] {
@@ -158,7 +154,7 @@ fn folder_row(app: &mut FilmcraftApp, ui: &mut egui::Ui, key: &str, depth: usize
     );
     icons::paint(ui.painter(), Rect::from_center_size(pos2(x + 18.0, r.center().y), vec2(13.0, 13.0)), Icon::Folder, t.text_dim);
     let name = key.rsplit('/').next().unwrap_or(key);
-    ui.painter().text(pos2(x + 30.0, r.center().y), Align2::LEFT_CENTER, name, Tokens::ui(12.0), t.text);
+    ui.painter().text(pos2(x + 30.0, r.center().y), Align2::LEFT_CENTER, crate::i18n::t(name), Tokens::ui(12.0), t.text);
     app.auto.add(&format!("effects.folder.{key}"), r, name);
     if resp.clicked() {
         if open {
@@ -175,7 +171,7 @@ fn folder_row(app: &mut FilmcraftApp, ui: &mut egui::Ui, key: &str, depth: usize
 fn apply_menu(app: &mut FilmcraftApp, resp: &egui::Response) -> bool {
     let mut chosen = false;
     resp.context_menu(|ui| {
-        let b = ui.button("Apply to Selected Clips");
+        let b = ui.button(tl!("Apply to Selected Clips"));
         app.auto.add("effects.presetMenu.apply", b.rect, "Apply to Selected Clips");
         if b.clicked() {
             chosen = true;
@@ -186,13 +182,19 @@ fn apply_menu(app: &mut FilmcraftApp, resp: &egui::Response) -> bool {
 }
 
 /// A preset's thumbnail texture (rendered once per size, cached by name).
-fn preset_texture(app: &mut FilmcraftApp, ctx: &egui::Context, p: &filmcraft_render::lumetri_presets::LumetriPreset, w: usize) -> egui::TextureId {
+fn preset_texture(app: &mut FilmcraftApp, ctx: &egui::Context, p: &filmcraft_render::lumetri_presets::LumetriPreset, w: usize) -> Option<egui::TextureId> {
     let name = format!("lumetri-preset-{}-{w}", p.name);
     if let Some((id, _)) = app.texture_existing(&name) {
-        return id;
+        return Some(id);
     }
     let h = (w * 9 / 16).max(1);
-    let img = filmcraft_render::lumetri_presets::thumbnail(p, w, h);
+    let img = match filmcraft_render::lumetri_presets::thumbnail(p, w, h) {
+        Ok(img) => img,
+        Err(error) => {
+            app.ui.status = error;
+            return None;
+        }
+    };
     let rgba = crate::frames::Rgba { w: img.w, h: img.h, px: img.over_black_rgba8() };
     let key = crate::frames::FrameKey {
         target: crate::frames::Target::Item(filmcraft_project::ItemId(u64::MAX)),
@@ -201,7 +203,7 @@ fn preset_texture(app: &mut FilmcraftApp, ctx: &egui::Context, p: &filmcraft_ren
         revision: 0,
         draft: false,
     };
-    app.texture_for(ctx, &name, key, &rgba)
+    Some(app.texture_for(ctx, &name, key, &rgba))
 }
 
 /// The Lumetri Presets folder of the tree: sub-folders and preset rows with thumbnails. Returns
@@ -210,7 +212,7 @@ fn lumetri_rows(app: &mut FilmcraftApp, ui: &mut egui::Ui, filter: &str) -> Opti
     use filmcraft_render::lumetri_presets as lp;
     let t = app.tokens;
     let top = "Lumetri Presets";
-    let presets: Vec<lp::LumetriPreset> = lp::presets().into_iter().filter(|p| filter.is_empty() || p.name.to_ascii_lowercase().contains(filter)).collect();
+    let presets: Vec<lp::LumetriPreset> = lp::presets().into_iter().filter(|p| crate::i18n::matches_query(p.name, filter)).collect();
     if !filter.is_empty() && presets.is_empty() {
         return None;
     }
@@ -240,12 +242,12 @@ fn lumetri_rows(app: &mut FilmcraftApp, ui: &mut egui::Ui, filter: &str) -> Opti
             if resp.hovered() {
                 ui.painter().rect_filled(r, 0.0, t.hover);
             }
-            let tex = preset_texture(app, ui.ctx(), p, 64);
+            let Some(tex) = preset_texture(app, ui.ctx(), p, 64) else { continue };
             let tr = Rect::from_min_size(pos2(r.min.x + 40.0, r.min.y + 3.0), vec2(32.0, 18.0));
             ui.painter().image(tex, tr, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-            ui.painter().text(pos2(tr.max.x + 8.0, r.center().y), Align2::LEFT_CENTER, p.name, Tokens::ui(12.0), t.text);
+            ui.painter().text(pos2(tr.max.x + 8.0, r.center().y), Align2::LEFT_CENTER, crate::i18n::t(p.name), Tokens::ui(12.0), t.text);
             app.auto.add(&format!("effects.lumetriPreset.{}", p.name), r, p.name);
-            let resp = resp.on_hover_text(p.description);
+            let resp = resp.on_hover_text(crate::i18n::t(p.description));
             if apply_menu(app, &resp) {
                 apply = Some(p.name.to_string());
             }
@@ -276,11 +278,11 @@ fn preset_grid(app: &mut FilmcraftApp, ui: &mut egui::Ui, area: Rect) -> Option<
             break;
         }
         let pic = Rect::from_min_size(cell.min, vec2(cw, ch));
-        let tex = preset_texture(app, ui.ctx(), p, 160);
-        let resp = ui.interact(cell, egui::Id::new(("lumetri-grid", p.name)), Sense::click()).on_hover_text(p.description);
+        let tex = preset_texture(app, ui.ctx(), p, 160)?;
+        let resp = ui.interact(cell, egui::Id::new(("lumetri-grid", p.name)), Sense::click()).on_hover_text(crate::i18n::t(p.description));
         ui.painter().rect_filled(cell, 3.0, if resp.hovered() { t.hover } else { t.field_bg });
         ui.painter().image(tex, pic.shrink(2.0), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
-        let label = ui.painter().layout(p.name.to_string(), Tokens::ui(11.0), t.text, cw - 6.0);
+        let label = ui.painter().layout(crate::i18n::t(p.name).to_string(), Tokens::ui(11.0), t.text, cw - 6.0);
         ui.painter().galley(pos2(cell.min.x + 4.0, pic.max.y + 2.0), label, t.text);
         app.auto.add(&format!("effects.presetGrid.{}", p.name), cell, p.name);
         if apply_menu(app, &resp) {

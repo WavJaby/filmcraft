@@ -805,7 +805,7 @@ pub fn info_json(name: &str, path: Option<&str>, info: &filmcraft_media::MediaIn
             "bitrate": vs.bitrate, "color": format!("{:?} / {:?} / {:?}", vs.color.primaries, vs.color.transfer, vs.color.matrix),
         });
     }
-    if let Some(a) = &info.audio {
+    if let Some(a) = info.audio() {
         v["audio"] = json!({"codec": a.codec, "sampleRate": a.sample_rate, "channels": a.channels, "bitsPerSample": a.bits_per_sample});
     }
     v
@@ -1002,7 +1002,7 @@ fn edit_offline(s: &mut Session, p: &Value) -> Result<Value> {
 fn source_settings(s: &mut Session, p: &Value) -> Result<Value> {
     let id = targets(s, p).into_iter().find(|i| media_of(&s.project, *i).is_some()).ok_or_else(|| EngineError::Other("select a clip".into()))?;
     let (_, m) = media_of(&s.project, id).ok_or_else(|| EngineError::Other("select a clip".into()))?;
-    let codec = m.info.video.as_ref().map(|v| v.codec.clone()).or_else(|| m.info.audio.as_ref().map(|a| a.codec.clone())).unwrap_or_default();
+    let codec = m.info.video.as_ref().map(|v| v.codec.clone()).or_else(|| m.info.audio().map(|a| a.codec.clone())).unwrap_or_default();
     Ok(json!({
         "item": id.0,
         "codec": codec,

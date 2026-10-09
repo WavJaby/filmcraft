@@ -25,6 +25,47 @@ fn text_of(l: &filmcraft_project::graphic::LayerSpec) -> String {
 }
 
 #[test]
+fn graphic_duration_does_not_set_its_timeline_position() {
+    for command in ["graphics.newText", "graphics.newShape"] {
+        for playhead_frame in [0, 72] {
+            for seconds in [1, 2] {
+                let mut s = Session::default();
+                s.execute("file.newSequence", json!({"name": "Placement", "fps": 24, "width": 128, "height": 128, "video": 1, "audio": 1})).unwrap();
+                s.execute("playhead.set", json!({"frame": playhead_frame})).unwrap();
+                let start = s.playhead();
+                let r = s.execute(command, json!({"seconds": seconds})).unwrap();
+                let clip = ClipId(r["clip"].as_u64().unwrap());
+                let q = s.active_sequence().unwrap();
+                let (_, it) = q.find_item(clip).unwrap();
+                assert_eq!(it.start, start, "{command}, duration {seconds}, playhead {playhead_frame}");
+                assert_eq!(it.duration, Tick::from_seconds_f64(f64::from(seconds)));
+                s.execute("edit.undo", json!({})).unwrap();
+                assert!(s.active_sequence().unwrap().find_item(clip).is_none());
+                s.execute("edit.redo", json!({})).unwrap();
+                assert_eq!(s.active_sequence().unwrap().find_item(clip).unwrap().1.start, start);
+            }
+        }
+    }
+}
+
+#[test]
+fn graphic_duration_keeps_explicit_time_frame_and_timecode_placement() {
+    for command in ["graphics.newText", "graphics.newShape"] {
+        for mut params in [json!({"time": 0}), json!({"frame": 0}), json!({"timecode": "00:00:00:00"})] {
+            let mut s = Session::default();
+            s.execute("file.newSequence", json!({"name": "Placement", "fps": 24, "width": 128, "height": 128, "video": 1, "audio": 1})).unwrap();
+            s.execute("playhead.set", json!({"frame": 72})).unwrap();
+            params["seconds"] = json!(2);
+            let r = s.execute(command, params).unwrap();
+            let clip = ClipId(r["clip"].as_u64().unwrap());
+            let (_, it) = s.active_sequence().unwrap().find_item(clip).unwrap();
+            assert_eq!(it.start, Tick::ZERO, "{command}");
+            assert_eq!(it.duration, Tick::from_seconds_f64(2.0));
+        }
+    }
+}
+
+#[test]
 fn new_text_makes_a_graphic_clip_above_the_footage() {
     let mut s = demo();
     let t = s.playhead();

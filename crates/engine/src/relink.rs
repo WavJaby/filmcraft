@@ -263,7 +263,7 @@ pub fn check_candidate(s: &Session, item: ItemId, path: &str, o: &MatchOptions) 
                     if info.video.is_some() != m.info.video.is_some() {
                         c.problems.push("video stream presence differs".into());
                     }
-                    if let (Some(a), Some(b)) = (&info.audio, &m.info.audio)
+                    if let (Some(a), Some(b)) = (info.audio(), m.info.audio())
                         && a.channels != b.channels
                     {
                         c.problems.push(format!("audio channels differ ({} vs {})", a.channels, b.channels));
@@ -303,8 +303,9 @@ pub fn derive_remap(old: &str, new: &str) -> Option<(String, String)> {
 /// Apply a remap to a path (None when it doesn't start with the old prefix).
 pub fn apply_remap(path: &str, from: &str, to: &str) -> Option<String> {
     let p = path.replace('\\', "/");
-    let from = from.trim_end_matches('/');
-    let rest = p.strip_prefix(from)?;
+    let from = from.replace('\\', "/");
+    let to = to.replace('\\', "/");
+    let rest = p.strip_prefix(from.trim_end_matches('/'))?;
     if !(rest.is_empty() || rest.starts_with('/')) {
         return None;
     }

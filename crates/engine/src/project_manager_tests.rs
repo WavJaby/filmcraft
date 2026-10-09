@@ -59,11 +59,12 @@ fn collect_files_copies_used_media_and_opens() {
     let jobs = s.execute("jobs.list", json!({})).unwrap();
     assert!(jobs[0]["result"].get("error").is_none(), "{jobs}");
     // the copy opens with its media next to it, and plays the same frames
+    drop(s); // Windows does not allow renaming a directory while decoder files are open.
     std::fs::rename(root.join("Media"), root.join("Media-gone")).unwrap();
     let mut t = opened(r["project"].as_str().unwrap());
     for it in t.project.items.values().filter_map(|i| i.as_media()) {
         let MediaRef::File { path } = &it.media else { panic!() };
-        assert!(path.starts_with(&*dest.to_string_lossy()), "{path}");
+        assert!(std::path::Path::new(path).starts_with(&dest), "{path}");
         assert!(it.identity.is_some());
     }
     let after: Vec<Vec<u8>> = (0..36).step_by(5).map(|f| frame_rgba(&mut t, f, 1.0).2).collect();
