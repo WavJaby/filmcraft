@@ -48,6 +48,28 @@ pub use mask::GpuMask;
 /// shader applies the sRGB encoding.
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Source cache budget: stacked layers + playback lookahead, shared by uploads and imports.
+const SOURCE_CACHE_CAPACITY: usize = 24;
+
+/// The two planes of a hardware decoder's picture as textures on the compositor's device: luma
+/// (`R8Unorm` / `R16Unorm`) and interleaved chroma (`Rg8Unorm` / `Rg16Unorm`), plus whatever keeps
+/// their memory alive.
+pub struct ImportedPlanes {
+    pub luma: wgpu::Texture,
+    pub chroma: wgpu::Texture,
+    pub keepalive: Box<dyn std::any::Any + Send + Sync>,
+}
+
+/// Opens a [`GpuSurface`] on a device (zero-copy: the OS decoder's memory, not an upload).
+pub type SurfaceImporter = fn(&dyn filmcraft_frame::GpuSurface, &wgpu::Device) -> Result<ImportedPlanes, String>;
+
+static IMPORTER: std::sync::OnceLock<SurfaceImporter> = std::sync::OnceLock::new();
+
+/// Register how GPU pictures reach the compositor's device (`filmcraft_platform` does it where the
+/// OS decoder can share its surfaces). Without one, GPU pictures are read back and uploaded.
+pub fn set_surface_importer(f: SurfaceImporter) {
+    let _ = IMPORTER.set(f);
+}
 
 struct Uploaded {
     /// Y, Cb, Cr (or the RGBA texture) and the alpha plane (the dummy texture when there is none).
@@ -61,6 +83,8 @@ struct Uploaded {
     /// The uploaded pixel buffers, kept alive while cached: the cache key is the buffer address,
     /// and a freed buffer's address can be reused by a different frame (stale texture).
     _pixels: PixelData,
+    /// Keeps imported (zero-copy) planes' memory alive.
+    _keep: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 pub struct GpuCompositor {
@@ -199,7 +223,7 @@ pub fn prepare_frame(f: &VideoFrame) -> Option<Prepared> {
         PixelData::Yuv16 { planes, bits, alpha, .. } => {
             Some(Prepared { planes: planes.iter().chain(alpha.as_ref()).map(|p| codes_to_f16_bytes(p, *bits)).collect() })
         }
-        PixelData::Rgba8(_) | PixelData::Yuv8 { .. } => None,
+        PixelData::Rgba8(_) | PixelData::Yuv8 { .. } | PixelData::Gpu(_) => None,
     }
 }
 
@@ -399,6 +423,7 @@ impl GpuCompositor {
             PixelData::RgbaF32(d) => Arc::as_ptr(d) as *const u8 as usize,
             PixelData::Yuv8 { planes, .. } => Arc::as_ptr(&planes[0]) as *const u8 as usize,
             PixelData::Yuv16 { planes, .. } => Arc::as_ptr(&planes[0]) as *const u8 as usize,
+            PixelData::Gpu(g) => g.surface().id() as usize,
         };
         let key = (id, f.width, f.height);
         self.clock += 1;
@@ -407,6 +432,20 @@ impl GpuCompositor {
             return key;
         }
         let (w, h) = (f.width, f.height);
+        if let PixelData::Gpu(g) = &f.data {
+            match self.import(g, f) {
+                Ok(up) => {
+                    self.cache_source(key, up);
+                    return key;
+                }
+                Err(e) => {
+                    // no zero-copy here (not the decoder's adapter, no importer): read it back once
+                    log::warn!("zero-copy import of a decoded picture failed ({e}); uploading it instead");
+                    let cpu = f.cpu().into_owned();
+                    return self.upload(&cpu, None);
+                }
+            }
+        }
         let d0 = self.dummy.clone();
         let dummy = || d0.clone();
         let up = match &f.data {
@@ -420,6 +459,7 @@ impl GpuCompositor {
                     chroma: (w, h),
                     last_used: self.clock,
                     _pixels: f.data.clone(),
+                    _keep: None,
                 }
             }
             PixelData::RgbaF32(d) => {
@@ -440,6 +480,7 @@ impl GpuCompositor {
                     chroma: (w, h),
                     last_used: self.clock,
                     _pixels: f.data.clone(),
+                    _keep: None,
                 }
             }
             PixelData::Yuv8 { planes, chroma, alpha } => {
@@ -458,6 +499,7 @@ impl GpuCompositor {
                     chroma: (cw, ch),
                     last_used: self.clock,
                     _pixels: f.data.clone(),
+                    _keep: None,
                 }
             }
             PixelData::Yuv16 { planes, chroma, bits, alpha } => {
@@ -487,33 +529,77 @@ impl GpuCompositor {
                     chroma: (cw, ch),
                     last_used: self.clock,
                     _pixels: f.data.clone(),
+                    _keep: None,
                 }
             }
+            // handled above
+            PixelData::Gpu(_) => return key,
         };
+        self.cache_source(key, up);
+        key
+    }
+
+    fn cache_source(&mut self, key: (usize, u32, u32), up: Uploaded) {
         self.uploads.insert(key, up);
-        // keep the most recent uploads (enough for several stacked layers + playback lookahead)
-        if self.uploads.len() > 24 {
+        if self.uploads.len() > SOURCE_CACHE_CAPACITY {
             let mut v: Vec<(u64, (usize, u32, u32))> = self.uploads.iter().map(|(k, u)| (u.last_used, *k)).collect();
             v.sort_unstable();
-            for (_, k) in v.into_iter().take(self.uploads.len() - 24) {
+            for (_, k) in v.into_iter().take(self.uploads.len() - SOURCE_CACHE_CAPACITY) {
                 self.uploads.remove(&k);
             }
         }
-        key
+    }
+
+    /// Open a decoder's GPU picture as this device's textures (no copy).
+    fn import(&mut self, g: &filmcraft_frame::GpuPixels, f: &VideoFrame) -> Result<Uploaded, String> {
+        let importer = IMPORTER.get().ok_or("no surface importer registered")?;
+        let planes = importer(g.surface().as_ref(), &self.device)?;
+        let (w, h) = (f.width, f.height);
+        let scale = match g.bits {
+            8 => u8::MAX as f32,
+            // P010 stores ten significant bits in the high bits of R16Unorm.
+            10 => u16::MAX as f32 / (1u32 << (u16::BITS - 10)) as f32,
+            _ => return Err(format!("unsupported GPU surface bit depth: {}", g.bits)),
+        };
+        let d0 = self.dummy.clone();
+        Ok(Uploaded {
+            views: [planes.luma.create_view(&Default::default()), planes.chroma.create_view(&Default::default()), d0.clone(), d0],
+            kind: 3,
+            code_scale: scale,
+            alpha_scale: 0.0,
+            chroma: (w.div_ceil(2), h.div_ceil(2)),
+            last_used: self.clock,
+            _pixels: f.data.clone(),
+            _keep: Some(Box::new((planes.luma, planes.chroma, planes.keepalive))),
+        })
     }
 
     /// The source description of an uploaded frame.
     fn src_info(&self, f: &VideoFrame, key: (usize, u32, u32)) -> Option<SrcInfo> {
         let up = self.uploads.get(&key)?;
-        Some(SrcInfo { kind: up.kind, code_scale: up.code_scale, alpha: up.alpha_scale, chroma: up.chroma, size: (f.width, f.height), color: f.color })
+        let code_levels = match &f.data {
+            PixelData::Yuv8 { .. } => 256.0,
+            PixelData::Yuv16 { bits, .. } => (*bits as f32).exp2(),
+            PixelData::Gpu(g) => (g.bits as f32).exp2(),
+            _ => 1.0,
+        };
+        Some(SrcInfo {
+            kind: up.kind,
+            code_scale: up.code_scale,
+            code_levels,
+            alpha: up.alpha_scale,
+            chroma: up.chroma,
+            size: (f.width, f.height),
+            color: f.color,
+        })
     }
 
     fn uniforms(src: &SrcInfo, m: &filmcraft_geom::Affine, opacity: f32, blend: Blend, out: (u32, u32)) -> [f32; 28] {
         let (kr, kb) = src.color.matrix.kr_kb();
-        let bits_scale = src.code_scale / 255.0; // code units relative to 8-bit
+        let bits_scale = src.code_levels / 256.0; // 2^(bits - 8), independent of texture encoding
         let (yo, ys, co, cs) = match (src.color.range, src.kind) {
-            (Range::Limited, 2) => (16.0 * bits_scale, 219.0 * bits_scale, 128.0 * bits_scale, 224.0 * bits_scale),
-            (Range::Full, 2) => (0.0, src.code_scale - 1.0, src.code_scale / 2.0, src.code_scale - 1.0),
+            (Range::Limited, 2 | 3) => (16.0 * bits_scale, 219.0 * bits_scale, 128.0 * bits_scale, 224.0 * bits_scale),
+            (Range::Full, 2 | 3) => (0.0, src.code_levels - 1.0, src.code_levels / 2.0, src.code_levels - 1.0),
             _ => (0.0, 1.0, 0.0, 1.0),
         };
         let transfer = match src.color.transfer {
@@ -645,6 +731,7 @@ impl GpuCompositor {
             let src = self.src_info(&l.frame, *k).unwrap_or(SrcInfo {
                 kind: 1,
                 code_scale: 1.0,
+                code_levels: 1.0,
                 alpha: 0.0,
                 chroma: (1, 1),
                 size: (l.frame.width, l.frame.height),
@@ -678,7 +765,7 @@ impl GpuCompositor {
             // what the layer draws: the effect result (linear premultiplied RGBA) or the frame
             let (u, tex) = match &job {
                 Some(j) => {
-                    let s = SrcInfo { kind: 1, code_scale: 1.0, alpha: 0.0, chroma: l.size(), size: l.size(), color: l.frame.color };
+                    let s = SrcInfo { kind: 1, code_scale: 1.0, code_levels: 1.0, alpha: 0.0, chroma: l.size(), size: l.size(), color: l.frame.color };
                     (Self::uniforms(&s, &l.matrix, l.opacity, l.blend, (w, h)), [j.result.clone(), self.dummy.clone(), self.dummy.clone(), self.dummy.clone()])
                 }
                 None => {
@@ -884,11 +971,13 @@ impl GpuCompositor {
     }
 }
 
-/// What a layer's shader samples: the texture kind (0 RGBA8 sRGB, 1 linear premultiplied RGBA
-/// float, 2 YUV planes), code scale, chroma plane size, picture size and colour description.
+/// Shader source: kind (0 RGBA8 sRGB, 1 linear premultiplied RGBA, 2 planar YUV, 3 biplanar YUV), scales, dimensions, color.
 struct SrcInfo {
     kind: u32,
+    /// Texture sample -> code units; independent of YUV quantization levels.
     code_scale: f32,
+    /// YUV quantization levels: 2^bits.
+    code_levels: f32,
     /// Alpha texture sample → alpha (0: the frame has no alpha plane).
     alpha: f32,
     chroma: (u32, u32),
