@@ -424,9 +424,9 @@ fn gpu_effect_layers_match_cpu_plan() {
     }
 }
 
-/// Plans without effects never create working textures.
+/// Bare YUV needs one source target; compute scratch exists only while effects need it.
 #[test]
-fn plain_layers_skip_the_effect_stage() {
+fn source_and_effect_scratch_have_separate_lifetimes() {
     let Some((dev, q)) = device() else {
         eprintln!("no GPU adapter; skipping");
         return;
@@ -435,6 +435,9 @@ fn plain_layers_skip_the_effect_stage() {
     let plan = FramePlan::Layers { width: 64, height: 36, layers: vec![PlanLayer::new(yuv_frame(64, 36), Affine::IDENTITY, 1.0, Blend::Normal)] };
     c.composite(&plan).unwrap();
     assert!(c.fx.as_ref().is_some_and(fx::FxStage::is_idle));
+    assert_eq!(c.source.as_ref().unwrap().texture_count(), 1);
+    let source_bytes = 64 * 36 * std::mem::size_of::<[f32; 4]>() as u64;
+    assert_eq!(c.working_bytes(), source_bytes);
     let fx = LayerFx { size: (64, 36), decimation: 1, ops: vec![FxOp::BlackWhite] };
     let with = FramePlan::Layers {
         width: 64,
@@ -443,9 +446,62 @@ fn plain_layers_skip_the_effect_stage() {
     };
     c.composite(&with).unwrap();
     assert!(!c.fx.as_ref().is_some_and(fx::FxStage::is_idle));
+    assert_eq!(c.working_bytes(), source_bytes * 2, "one source + one compute scratch");
     // and they are released once no layer needs them
     c.composite(&plan).unwrap();
     assert!(c.fx.as_ref().is_some_and(fx::FxStage::is_idle));
+    assert_eq!(c.source.as_ref().unwrap().texture_count(), 1);
+    let rgba = FramePlan::Layers { width: 64, height: 36, layers: vec![PlanLayer::new(ramp_layer(64, 36, 0), Affine::IDENTITY, 1.0, Blend::Normal)] };
+    c.composite(&rgba).unwrap();
+    assert_eq!(c.source.as_ref().unwrap().texture_count(), 0);
+    assert_eq!(c.working_bytes(), 0);
+}
+
+#[test]
+fn equal_sized_yuv_layers_reuse_one_working_image() {
+    let Some((dev, q)) = device() else { return };
+    let frame = yuv_frame(64, 36);
+    let first = PlanLayer::new(frame.clone(), Affine::IDENTITY, 1.0, Blend::Normal);
+    let second = PlanLayer::new(frame, Affine::translate(3.0, 2.0), 0.5, Blend::Normal);
+    let mut c = GpuCompositor::new(&dev, &q);
+    c.composite(&FramePlan::Layers { width: 64, height: 36, layers: vec![first, second] }).unwrap();
+    assert_eq!(c.source_draws, 2);
+    assert_eq!(c.source.as_ref().unwrap().texture_count(), 1);
+    assert_eq!(c.working_bytes(), 64 * 36 * std::mem::size_of::<[f32; 4]>() as u64);
+    c.composite(&FramePlan::Layers { width: 64, height: 36, layers: vec![] }).unwrap();
+    assert_eq!(c.working_bytes(), 0);
+}
+
+#[test]
+fn yuv_source_reconstruction_does_not_require_compute() {
+    let Some((dev, q)) = device() else { return };
+    let frame = yuv_frame(64, 36);
+    let plan = FramePlan::Layers { width: 64, height: 36, layers: vec![PlanLayer::new(frame.clone(), Affine::translate(0.5, 0.5), 1.0, Blend::Normal)] };
+    let mut c = GpuCompositor::new(&dev, &q);
+    c.composite(&plan).unwrap();
+    let expected = c.read_output().unwrap();
+    c.fx = None;
+    c.composite(&plan).unwrap();
+    assert_eq!(expected, c.read_output().unwrap());
+    assert_eq!(c.source.as_ref().unwrap().texture_count(), 1);
+    assert_eq!(c.source_draws, 2);
+    assert_eq!(c.source_fallbacks, 0);
+    c.source = None;
+    c.composite(&plan).unwrap();
+    assert_eq!(c.source_fallbacks, 1);
+    assert_ne!(expected, c.read_output().unwrap(), "fallback control must expose the old sampling order");
+}
+
+#[test]
+fn empty_effects_reuse_source_without_scratch() {
+    let Some((dev, q)) = device() else { return };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let frame = yuv_frame(64, 36);
+    let mut layer = PlanLayer::new(frame, Affine::IDENTITY, 1.0, Blend::Normal);
+    layer.fx = Some(Arc::new(LayerFx { size: (64, 36), decimation: 1, ops: vec![] }));
+    c.composite(&FramePlan::Layers { width: 64, height: 36, layers: vec![layer] }).unwrap();
+    assert_eq!(c.source.as_ref().unwrap().texture_count(), 1);
+    assert!(c.fx.as_ref().unwrap().is_idle());
 }
 
 /// Without an effect stage (devices without compute shaders) the compositor renders a layer's

@@ -16,9 +16,9 @@ impl GpuSurface for LostSurface {
     fn byte_len(&self) -> usize {
         4 * 4 + 2 * 2 * 2
     }
-    fn download(&self) -> Result<PixelData, String> {
+    fn prepare_cpu(&self, transfer: filmcraft_frame::CpuTransfer) {
         self.0.fetch_add(1, Ordering::Relaxed);
-        Err(FAILURE.into())
+        transfer.complete(Err(FAILURE.into()));
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -34,7 +34,7 @@ fn frame() -> (VideoFrame, Arc<LostSurface>) {
         VideoFrame {
             width: 4,
             height: 4,
-            data: PixelData::Gpu(GpuPixels::new(surface.clone(), Chroma::C420, 8)),
+            data: PixelData::Gpu(GpuPixels::new(surface.clone(), filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 })),
             color: filmcraft_color::ColorInfo::REC709,
             par: (1, 1),
             pts: filmcraft_time::Tick::ZERO,

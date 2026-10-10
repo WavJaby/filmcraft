@@ -392,9 +392,12 @@ impl FilmcraftApp {
             return None;
         }
         let t0 = web_time::Instant::now();
+        filmcraft_frame::pending::take();
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.compositor.composite_prepared(&plan.plan, Some(&plan.prepared))));
+        let pending = filmcraft_frame::pending::take();
         let (view, size) = match ran {
             Ok(Ok(output)) => output,
+            Ok(Err(_)) if pending => return None,
             Ok(Err(error)) => {
                 self.frames.reject_plan(key, error);
                 return None;

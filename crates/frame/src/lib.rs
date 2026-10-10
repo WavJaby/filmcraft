@@ -7,10 +7,13 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+mod cpu;
+pub mod pending;
 pub mod pool;
+pub use cpu::{CpuReadiness, CpuTransfer};
 
 use std::borrow::Cow;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use filmcraft_color::{ColorInfo, DecodeTable, Matrix, Range, linear_to_srgb_u8, normalize_c, normalize_y, srgb_u8_to_linear_table, to_linear, ycbcr_to_rgb};
 use filmcraft_time::Tick;
@@ -43,60 +46,78 @@ impl Chroma {
     }
 }
 
-/// A decoded picture that lives in GPU memory (a hardware decoder's output, shared with the
-/// renderer's device): the platform decoder implements this, the GPU compositor samples it without
-/// any copy, and every CPU consumer reads it through [`GpuPixels::cpu`], which downloads it once.
+/// GPU-resident picture: platform adapters own interop and CPU extraction; the compositor imports it through that boundary.
+/// CPU consumers share one prepared representation through GpuPixels::cpu.
 pub trait GpuSurface: Send + Sync + std::fmt::Debug {
     /// Picture size in luma samples.
     fn size(&self) -> (u32, u32);
     /// GPU memory the picture occupies (cache accounting).
     fn byte_len(&self) -> usize;
-    /// The picture in planar CPU form (`PixelData::Yuv8` / `Yuv16`).
-    fn download(&self) -> Result<PixelData, String>;
+    /// Complete CPU extraction now or asynchronously; retain source resources until completion. Preserve original picture semantics; CPU pixels need not match the GPU import's representation.
+    fn prepare_cpu(&self, transfer: CpuTransfer);
     /// The concrete surface, for the GPU compositor to import.
     fn as_any(&self) -> &dyn std::any::Any;
     /// Process-unique id of the surface (upload cache key).
     fn id(&self) -> u64;
 }
 
-/// A [`GpuSurface`] with its chroma layout and bit depth, and the CPU copy once something asked
-/// for it.
+/// GPU source representation; RGB sampling must not apply YUV reconstruction again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuFormat {
+    Yuv { chroma: Chroma, bits: u32 },
+    Rgba8,
+}
+
+/// A GPU surface and its once-prepared CPU representation.
 #[derive(Clone)]
 pub struct GpuPixels {
     surface: Arc<dyn GpuSurface>,
-    pub chroma: Chroma,
-    /// Significant bits per sample (8 = NV12-like, 10 = P010-like).
-    pub bits: u32,
-    cpu: Arc<OnceLock<Result<PixelData, String>>>,
+    pub format: GpuFormat,
+    cpu: Arc<cpu::CpuState>,
 }
 
 impl std::fmt::Debug for GpuPixels {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GpuPixels").field("surface", &self.surface).field("chroma", &self.chroma).field("bits", &self.bits).finish()
+        f.debug_struct("GpuPixels").field("surface", &self.surface).field("format", &self.format).finish()
     }
 }
 
 impl GpuPixels {
-    pub fn new(surface: Arc<dyn GpuSurface>, chroma: Chroma, bits: u32) -> Self {
-        Self { surface, chroma, bits, cpu: Arc::new(OnceLock::new()) }
+    pub fn new(surface: Arc<dyn GpuSurface>, format: GpuFormat) -> Self {
+        Self { surface, format, cpu: Arc::default() }
     }
 
     pub fn surface(&self) -> &Arc<dyn GpuSurface> {
         &self.surface
     }
 
-    /// Download once; clones share successful pixels or a terminal error.
+    /// Start extraction once; clones share pending work, successful pixels or terminal failure.
+    pub fn prepare_cpu(&self) -> CpuReadiness<'_> {
+        if let Some(transfer) = self.cpu.start() {
+            self.surface.prepare_cpu(transfer);
+        }
+        self.cpu.readiness()
+    }
+
+    /// Native callers wait for concurrent extraction; browser callers must prepare before consuming.
     pub fn cpu(&self) -> Result<&PixelData, String> {
-        self.cpu
-            .get_or_init(|| {
-                let data = self.surface.download()?;
-                if matches!(data, PixelData::Gpu(_)) {
-                    return Err("GPU download returned another GPU surface".into());
-                }
-                Ok(data)
-            })
-            .as_ref()
-            .map_err(Clone::clone)
+        let readiness = self.prepare_cpu();
+        #[cfg(not(target_arch = "wasm32"))]
+        let readiness = match readiness {
+            CpuReadiness::Pending => {
+                self.cpu.wait();
+                self.cpu.readiness()
+            }
+            ready => ready,
+        };
+        match readiness {
+            CpuReadiness::Ready(pixels) => Ok(pixels),
+            CpuReadiness::Failed(error) => Err(error.into()),
+            CpuReadiness::Pending => {
+                pending::mark();
+                Err("CPU pixels are still being prepared".into())
+            }
+        }
     }
 }
 
@@ -110,7 +131,7 @@ pub enum PixelData {
     Yuv8 { planes: [Arc<Vec<u8>>; 3], chroma: Chroma, alpha: Option<Arc<Vec<u8>>> },
     /// 9–16-bit planar Y'CbCr stored in u16 (`bits` significant bits).
     Yuv16 { planes: [Arc<Vec<u16>>; 3], chroma: Chroma, bits: u32, alpha: Option<Arc<Vec<u16>>> },
-    /// A planar Y'CbCr picture in GPU memory (see [`GpuSurface`]); CPU code uses
+    /// A YUV/RGB picture in GPU memory (see [`GpuSurface`]); CPU code uses
     /// [`VideoFrame::cpu`].
     Gpu(GpuPixels),
 }
@@ -190,7 +211,10 @@ impl VideoFrame {
 
     pub fn format_label(&self) -> String {
         match &self.data {
-            PixelData::Gpu(g) => format!("YUV {} {}-bit (GPU)", g.chroma.label(), g.bits),
+            PixelData::Gpu(g) => match g.format {
+                GpuFormat::Yuv { chroma, bits } => format!("YUV {} {bits}-bit (GPU)", chroma.label()),
+                GpuFormat::Rgba8 => "RGBA 8-bit (GPU)".into(),
+            },
             PixelData::Rgba8(_) => "RGBA 8-bit".into(),
             PixelData::RgbaF32(_) => "RGBA 32-bit float".into(),
             PixelData::Yuv8 { chroma, .. } => format!("YUV {} 8-bit", chroma.label()),
@@ -761,9 +785,9 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-        fn download(&self) -> Result<PixelData, String> {
+        fn prepare_cpu(&self, transfer: CpuTransfer) {
             self.downloads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Ok(self.pixels.clone())
+            transfer.complete(Ok(self.pixels.clone()));
         }
     }
 
@@ -778,7 +802,7 @@ mod tests {
             pts: Tick::ZERO,
         };
         let surface = Arc::new(TestSurface { downloads: std::sync::atomic::AtomicUsize::new(0), pixels: source.data.clone() });
-        let frame = VideoFrame { data: PixelData::Gpu(GpuPixels::new(surface.clone(), Chroma::C420, 8)), ..source };
+        let frame = VideoFrame { data: PixelData::Gpu(GpuPixels::new(surface.clone(), GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 })), ..source };
         for n in [1, 2] {
             let (w, h) = frame.decimated_size(n);
             let r = Region { x: 0, y: 0, w, h };
@@ -861,7 +885,7 @@ mod tests {
         let frame = VideoFrame {
             width: 4,
             height: 4,
-            data: PixelData::Gpu(GpuPixels::new(surface.clone(), Chroma::C420, 8)),
+            data: PixelData::Gpu(GpuPixels::new(surface.clone(), GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 })),
             color: ColorInfo::REC709,
             par: (4, 3),
             pts: Tick(123),
@@ -889,11 +913,14 @@ mod tests {
     #[test]
     fn nested_gpu_download_is_a_terminal_error() {
         let inner = Arc::new(TestSurface { downloads: Default::default(), pixels: PixelData::Rgba8(Arc::new(vec![0; 4 * 4 * 4])) });
-        let outer = Arc::new(TestSurface { downloads: Default::default(), pixels: PixelData::Gpu(GpuPixels::new(inner.clone(), Chroma::C420, 8)) });
+        let outer = Arc::new(TestSurface {
+            downloads: Default::default(),
+            pixels: PixelData::Gpu(GpuPixels::new(inner.clone(), GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 })),
+        });
         let frame = VideoFrame {
             width: 4,
             height: 4,
-            data: PixelData::Gpu(GpuPixels::new(outer.clone(), Chroma::C420, 8)),
+            data: PixelData::Gpu(GpuPixels::new(outer.clone(), GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 })),
             color: ColorInfo::REC709,
             par: (1, 1),
             pts: Tick::ZERO,

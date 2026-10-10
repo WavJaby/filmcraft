@@ -233,7 +233,7 @@ impl MfDecoder {
         let shared = Arc::new(SharedSurface::create(&self.gpu, self.format, (w, h))?);
         self.gpu.copy_picture(shared.texture(), &tex, index, (cx, cy, w, h))?;
         let surface = Arc::new(MfSurface::new(self.gpu.clone(), shared, self.geometry));
-        let data = PixelData::Gpu(GpuPixels::new(surface, Chroma::C420, self.format.bits()));
+        let data = PixelData::Gpu(GpuPixels::new(surface, filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: self.format.bits() }));
         Ok(VideoFrame { width: w, height: h, data, color: self.geometry.color, par: self.geometry.par, pts: filmcraft_time::Tick::ZERO })
     }
 

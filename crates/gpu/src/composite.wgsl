@@ -1,8 +1,8 @@
 // FilmCraft GPU compositor.
 // Layers are drawn as transformed quads; the fragment shader samples the source (YUV planes or
 // RGBA) with manual bilinear filtering (textureLoad, so any float format works) and N×N
-// supersampling over the pixel footprint when minifying, converts to linear light, premultiplies
-// and scales by opacity. Normal layers blend into the Rgba16Float accumulator with fixed-function
+// supersampling over the pixel footprint when minifying. Sources reconstruct to linear premultiplied
+// working images before transformed sampling where supported; direct YUV sampling remains the capability fallback. Normal layers blend into the Rgba16Float accumulator with fixed-function
 // premultiplied "over"; Dissolve does too (each pixel is either dropped or drawn opaque). The other
 // blend modes (`fs_blend`) read the accumulator under the layer from a copy (`backdrop`) and write
 // the composited result, with the math of `filmcraft_render::blend::composite`.
@@ -14,7 +14,7 @@ struct U {
     p0: vec4<f32>,   // opacity, kind (0 rgba8 srgb straight, 1 rgba16f premul linear, 2 yuv planar, 3 yuv with interleaved chroma), taps, transfer (0 srgb, 1 linear, 2 pq, 3 hlg)
     p1: vec4<f32>,   // y_off y_scale c_off c_scale (code units)
     p2: vec4<f32>,   // kr kb code_scale footprint
-    p3: vec4<f32>,   // blend mode, alpha-plane scale (0: none), effect-source integer decimation, unused
+    p3: vec4<f32>,   // blend mode, alpha-plane scale (0: none), source integer decimation, unused
 };
 
 @group(0) @binding(0) var<uniform> u: U;
@@ -283,12 +283,9 @@ fn linear_to_srgb(v: vec3<f32>) -> vec3<f32> {
     return select(hi, v * 12.92, v <= vec3(0.0031308));
 }
 
-// Effect sources are axis-aligned integer-decimated working images. Raster-interpolated source
-// coordinates can mix adjacent texels at a nominal pixel center, inventing alpha near zero.
-// Keep the regular transformed/minified layer path unchanged; only this source draw uses its
-// exact working-pixel position and the host's integer decimation.
+// Reconstruct at exact working-pixel centers before spatial sampling; interpolated vertex coordinates can invent alpha near zero.
 @fragment
-fn fs_fx_source(in: VOut) -> @location(0) vec4<f32> {
+fn fs_source(in: VOut) -> @location(0) vec4<f32> {
     return layer_color(in.pos.xy * u.p3.z);
 }
 
