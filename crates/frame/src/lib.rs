@@ -879,7 +879,9 @@ mod tests {
             let mut out = vec![f32::NAN; w * h * 4];
             frame.convert_region(n, None, r, &mut out).unwrap();
             // BT.709 limited-range Y16/C128 -> opaque black; no old buffer slot may survive.
-            assert!(out.chunks_exact(4).all(|p| p == [0.0, 0.0, 0.0, 1.0]));
+            let (pixels, remainder) = out.as_chunks::<4>();
+            assert!(remainder.is_empty());
+            assert!(pixels.iter().all(|p| *p == [0.0, 0.0, 0.0, 1.0]));
         }
         assert_eq!(surface.downloads.load(std::sync::atomic::Ordering::Relaxed), 1);
     }

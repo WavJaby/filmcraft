@@ -2427,7 +2427,7 @@ mod gpu_fallback_tests {
         fn picture(app: &mut super::FilmcraftApp, ctx: &egui::Context, target: super::frames::Target, frame: i64) -> (super::FrameKey, egui::FullOutput) {
             let start = Instant::now();
             loop {
-                let output = ctx.run_ui(
+                let mut output = ctx.run_ui(
                     egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))), ..Default::default() },
                     |ui| {
                         let rect = ui.max_rect();
@@ -2451,6 +2451,7 @@ mod gpu_fallback_tests {
                         return (key, output);
                     }
                 }
+                output.textures_delta.clear();
                 assert!(start.elapsed().as_secs_f64() < super::SCREENSHOT_SETTLE_MAX_S, "Program monitor did not settle: {:?}", app.program_picture());
                 std::thread::yield_now();
             }
@@ -2500,7 +2501,8 @@ mod gpu_fallback_tests {
         assert!(!broken.load(Ordering::Relaxed), "healthy-device control");
         assert!(!super::panels::menu_dialogs::software_renderer(&app), "healthy control must select the GPU");
         let ctx = egui::Context::default();
-        let (healthy_key, _) = picture(&mut app, &ctx, super::frames::Target::SequencePlan(seq), 0);
+        let (healthy_key, mut healthy_output) = picture(&mut app, &ctx, super::frames::Target::SequencePlan(seq), 0);
+        healthy_output.textures_delta.clear();
         let gpu = app.gpu.as_ref().unwrap();
         assert_eq!(gpu.last_key, Some(healthy_key));
         assert!(!app.textures.contains_key("monitor-program"), "healthy control must not use CPU textures");
@@ -2513,7 +2515,7 @@ mod gpu_fallback_tests {
         assert!(broken.load(Ordering::Relaxed), "device-lost notification must reach preview policy");
         for (frame, color) in expected.iter().enumerate().skip(1) {
             app.session.set_playhead(rate.tick_of(frame as i64));
-            let (key, output) = picture(&mut app, &ctx, super::frames::Target::Sequence(seq), frame as i64);
+            let (key, mut output) = picture(&mut app, &ctx, super::frames::Target::Sequence(seq), frame as i64);
             assert!(!app.gpu_compositor_active(), "monitor must retire the lost compositor");
             assert_eq!(app.texture_key("monitor-program"), Some(key));
             let id = app.texture_existing("monitor-program").unwrap().0;
@@ -2537,6 +2539,7 @@ mod gpu_fallback_tests {
             assert_eq!(img.px, cpu.over_black_rgba8(), "normal worker must match the independent source-map reference");
             assert_eq!(uploaded, img.px, "egui upload must contain the rendered CPU pixels");
             assert!(uploaded.chunks_exact(4).all(|p| p == color), "post-loss monitor must show the next primary matte");
+            output.textures_delta.clear();
         }
         eprintln!("Preview output: healthy GPU red -> destroyed device -> CPU green/blue; reference/cache/egui upload/draw commands match");
     }

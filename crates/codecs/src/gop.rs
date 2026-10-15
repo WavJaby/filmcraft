@@ -904,8 +904,12 @@ mod tests {
         let surface = Arc::new(UnreadableSurface);
         let (width, height) = filmcraft_frame::GpuSurface::size(&*surface);
         let frame = VideoFrame {
+            width,
+            height,
             data: PixelData::Gpu(GpuPixels::new(surface, filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: u8::BITS })),
-            ..VideoFrame::rgba8(width, height, Vec::new())
+            color: filmcraft_color::ColorInfo::REC709,
+            par: (1, 1),
+            pts: filmcraft_time::Tick::ZERO,
         };
         let crop = Region { x: 0, y: 0, w: usize::try_from(width / 2).unwrap(), h: usize::try_from(height).unwrap() };
         // Partial crop and quarter-turn each require unavailable CPU pixels.
