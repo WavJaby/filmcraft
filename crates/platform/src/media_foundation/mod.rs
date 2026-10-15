@@ -139,6 +139,10 @@ pub struct MfDecoder {
     size_checked: bool,
     /// The picture rectangle is even in every coordinate, as sharing a 4:2:0 surface needs.
     can_share: bool,
+    #[cfg(test)]
+    fail_copy_wait: bool,
+    #[cfg(test)]
+    failed_copy_waits: usize,
     /// [`VideoDecoder::flush`] drained the MFT, which then behaves as at the end of a stream: it
     /// only restarts at an IDR picture, the references of the run are gone.
     drained: bool,
@@ -178,6 +182,10 @@ impl MfDecoder {
             first: true,
             size_checked: false,
             can_share: true,
+            #[cfg(test)]
+            fail_copy_wait: false,
+            #[cfg(test)]
+            failed_copy_waits: 0,
             drained: false,
             fail_after: None,
             fed: 0,
@@ -242,6 +250,11 @@ impl MfDecoder {
         // shared pictures were copied on the GPU's queue: wait for the copies before anyone else
         // (another device) reads them
         if out.get(first_new..).is_some_and(|f| f.iter().any(|d| matches!(d.frame.data, PixelData::Gpu(_)))) {
+            #[cfg(test)]
+            if self.fail_copy_wait {
+                self.failed_copy_waits += 1;
+                return Err("injected GPU copy wait failure".into());
+            }
             self.gpu.wait_for_gpu()?;
         }
         r
@@ -367,20 +380,19 @@ impl VideoDecoder for MfDecoder {
         r
     }
 
-    fn flush(&mut self) -> Vec<DecodedFrame> {
+    fn flush(&mut self) -> filmcraft_codecs::Result<Vec<DecodedFrame>> {
         let mut out = Vec::new();
-        if gpu::ensure_com().is_err() {
-            return out;
-        }
+        gpu::ensure_com().map_err(CodecError::Decode)?;
         let drained = self.mft.as_ref().map(Mft::drain).transpose().and_then(|_| self.collect(&mut out));
-        if let Err(e) = drained {
-            log::warn!("{}: {e} while flushing", self.name);
-        }
         self.in_flight.clear();
         // what follows a drain starts like a new run: the decoder is given the headers again
         self.need_headers = true;
         self.drained = true;
-        out
+        drained.map_err(|error| {
+            self.gpu.note_failure();
+            CodecError::Decode(error)
+        })?;
+        Ok(out)
     }
 
     fn reset(&mut self) {
@@ -413,5 +425,88 @@ impl Drop for MfDecoder {
     fn drop(&mut self) {
         // the decoder MFT is released on whichever thread drops the decoder: it needs COM
         let _ = gpu::ensure_com();
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/common/mod.rs"]
+mod test_common;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_copy_wait_during_flush_never_publishes_resident_pictures() {
+        const CHILD: &str = "FILMCRAFT_MF_FLUSH_WAIT_FAILURE_CHILD";
+        const TEST: &str = "media_foundation::tests::failed_copy_wait_during_flush_never_publishes_resident_pictures";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", TEST, "--nocapture"]).env(CHILD, "1").status().unwrap();
+            assert!(status.success(), "copy-wait failure child: {status}");
+            return;
+        }
+        let (finished, completion) = std::sync::mpsc::channel();
+        let watchdog = std::thread::spawn(move || {
+            // One minute bounds native driver hangs in this private test child.
+            if matches!(completion.recv_timeout(Duration::from_secs(60)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                eprintln!("Media Foundation flush wait-failure test exceeded its deadline");
+                std::process::exit(124);
+            }
+        });
+        exercise_flush_wait_failure();
+        finished.send(()).unwrap();
+        watchdog.join().unwrap();
+    }
+
+    fn exercise_flush_wait_failure() {
+        let ff = filmcraft_testkit::require_ffmpeg!();
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::DX12, ..wgpu::InstanceDescriptor::new_without_display_handle() });
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            eprintln!("SKIPPED: no DX12 adapter");
+            return;
+        };
+        eprintln!("copy-wait test adapter: {:?}", adapter.get_info());
+        let Ok((device, _queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())) else {
+            eprintln!("SKIPPED: no DX12 device");
+            return;
+        };
+        if !enable_zero_copy(&device) {
+            eprintln!("SKIPPED: renderer and decoder adapters do not share resident surfaces");
+            return;
+        }
+        let path = test_common::named(&ff, "h264_high.mp4").expect("H.264 B-frame fixture");
+        let stream = test_common::read_stream(&path);
+        let end = stream.sync.iter().enumerate().skip(1).find_map(|(i, sync)| sync.then_some(i)).expect("second GOP");
+        for fail in [false, true] {
+            let Ok(mut decoder) = MfDecoder::new(stream_info(&stream.entry).unwrap()) else {
+                eprintln!("SKIPPED: no Media Foundation decoder");
+                return;
+            };
+            let mut ready = Vec::new();
+            for (sample, pts) in &stream.samples[..end] {
+                ready.extend(decoder.decode(sample, *pts).unwrap());
+            }
+            assert!(ready.iter().any(|d| matches!(d.frame.data, PixelData::Gpu(_))), "decode must exercise resident copies");
+            assert!(!decoder.in_flight.is_empty(), "flush must drain held pictures");
+            eprintln!("copy-wait decoder: {}, ready={}, held={}", decoder.mft_name(), ready.len(), decoder.in_flight.len());
+            decoder.fail_copy_wait = fail;
+            let drained = decoder.flush();
+            let returned = drained.as_ref().map_or(0, Vec::len);
+            eprintln!("flush wait control: injected={fail}, forced failures={}, returned pictures={returned}", decoder.failed_copy_waits);
+            if fail {
+                assert_eq!(decoder.failed_copy_waits, 1, "injection must reach the copy-completion boundary");
+                assert!(
+                    matches!(drained, Err(CodecError::Decode(why)) if why == "injected GPU copy wait failure"),
+                    "an unsuccessful copy wait must return an error, never resident pictures"
+                );
+                decoder.gpu.wait_for_gpu().expect("healthy GPU drains after the injected failure");
+            } else {
+                let drained = drained.expect("healthy copy completion");
+                assert!(drained.iter().any(|d| matches!(d.frame.data, PixelData::Gpu(_))), "healthy flush returns resident pictures");
+                assert_eq!(decoder.failed_copy_waits, 0);
+            }
+        }
+        disable_zero_copy();
     }
 }

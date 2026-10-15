@@ -24,6 +24,7 @@ Only `crates/platform/src/media_foundation/interop.rs` extends the FFI allowlist
 ## Failure contract
 
 - Unsupported renderer/adapter/geometry keeps CPU decode output. A share failure disables sharing for that decoder stream and attempts the existing readback path.
+- Copy-completion failure returns a decoder error from decode or flush; the failed batch is not published. The hybrid decoder replays buffered samples in software or reports failure when replay cannot complete.
 - Import failure logs the cause and tries the picture's cached CPU materialization/upload. Materialization failure remains an error; it must not enter successful frame caches or encoder input.
 - P010 import requires `TEXTURE_FORMAT_16BIT_NORM` on the renderer device; missing support returns an import error before HAL wrapping. NV12 remains eligible on that device.
 - Disabling the compositor stops new GPU pictures. Existing pictures retain their owners and may still require a download; failure must be reported without losing project edits. Hardware-to-software decoder replay remains the hybrid decoder's separate responsibility.

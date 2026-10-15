@@ -165,12 +165,14 @@ impl VideoDecoder for AlphaDecoder {
         self.feed_alpha(pts);
         Ok(self.release(false))
     }
-    fn flush(&mut self) -> Vec<DecodedFrame> {
-        let out = self.color.flush();
+    fn flush(&mut self) -> crate::Result<Vec<DecodedFrame>> {
+        let out = self.color.flush()?;
         self.held.extend(out);
-        let rest = self.alpha.flush();
-        self.keep(rest);
-        self.release(true)
+        match self.alpha.flush() {
+            Ok(rest) => self.keep(rest),
+            Err(error) => log::warn!("WebM alpha drain failed ({error}); retaining colour pictures"),
+        }
+        Ok(self.release(true))
     }
     fn reset(&mut self) {
         self.color.reset();
