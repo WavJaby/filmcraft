@@ -113,6 +113,8 @@ impl ExportRenderer {
                 }
                 let instance = wgpu::Instance::default();
                 let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+                #[cfg(test)]
+                eprintln!("GPU export test adapter: {:?}", adapter.get_info());
                 let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()?;
                 // wgpu's default handler panics on a validation or out-of-memory error; log it and
                 // send the remaining frames to the CPU instead.

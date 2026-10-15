@@ -2463,6 +2463,7 @@ mod gpu_fallback_tests {
             eprintln!("SKIPPED: no Vulkan adapter");
             return;
         };
+        eprintln!("Preview loss test adapter: {:?}", adapter.get_info());
         let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let renderer = egui_wgpu::Renderer::new(&device, format, Default::default());
