@@ -673,6 +673,18 @@ impl Av1Decoder {
         Av1Decoder { dec: filmcraft_av1::Decoder::new(), config_obus, primed: false }
     }
 
+    fn convert_result(pictures: filmcraft_av1::Result<Vec<filmcraft_av1::Picture>>) -> Result<Vec<DecodedFrame>> {
+        pictures.map_err(|error| CodecError::Decode(error.to_string())).map(|pictures| {
+            pictures
+                .into_iter()
+                .map(|picture| {
+                    let pts = picture.pts;
+                    Self::convert(picture, pts)
+                })
+                .collect()
+        })
+    }
+
     fn convert(p: filmcraft_av1::Picture, pts: i64) -> DecodedFrame {
         use std::sync::Arc;
         let draft = p.draft;
@@ -711,25 +723,10 @@ impl VideoDecoder for Av1Decoder {
             }
         }
         // With frame threads pictures can come out of a later call; each carries its own pts.
-        let pics = self.dec.decode_pts(sample, pts).map_err(|e| CodecError::Decode(e.to_string()))?;
-        Ok(pics
-            .into_iter()
-            .map(|p| {
-                let pts = p.pts;
-                Self::convert(p, pts)
-            })
-            .collect())
+        Self::convert_result(self.dec.decode_pts(sample, pts))
     }
     fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
-        Ok(self
-            .dec
-            .flush()
-            .into_iter()
-            .map(|p| {
-                let pts = p.pts;
-                Self::convert(p, pts)
-            })
-            .collect())
+        Self::convert_result(self.dec.flush_result())
     }
     fn reset(&mut self) {
         self.dec = filmcraft_av1::Decoder::new();
@@ -750,6 +747,52 @@ pub fn av1_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
     match &e.codec {
         CodecConfig::Av1(c) => Some(Ok(Box::new(Av1Decoder::new(c.config_obus.clone())) as Box<dyn VideoDecoder>)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod av1_drain_tests {
+    use super::*;
+
+    #[test]
+    fn av1_failed_drain_preserves_the_original_cause() {
+        let cause = filmcraft_av1::Error::Invalid("injected queued AV1 frame failure");
+        let result = Av1Decoder::convert_result(Err(cause.clone()));
+        assert!(matches!(result, Err(CodecError::Decode(message)) if message == cause.to_string()));
+    }
+
+    #[test]
+    fn av1_drained_pictures_keep_their_own_timestamps() {
+        // Smallest even 4:2:0 picture; zero/positive/negative PTS cover timestamp boundaries.
+        let (width, height) = (2u32, 2u32);
+        let timestamps = [0, 1, -1];
+        let bt709_code = 1;
+        let pictures = timestamps
+            .into_iter()
+            .map(|pts| filmcraft_av1::Picture {
+                width,
+                height,
+                bit_depth: u8::BITS as u8,
+                subsampling_x: 1,
+                subsampling_y: 1,
+                mono_chrome: false,
+                planes: [vec![u8::MAX as u16; (width * height) as usize], vec![0; (width * height / 4) as usize], vec![0; (width * height / 4) as usize]],
+                color_primaries: bt709_code,
+                transfer_characteristics: bt709_code,
+                matrix_coefficients: bt709_code,
+                full_range: false,
+                pts,
+                draft: false,
+            })
+            .collect();
+        let frames = Av1Decoder::convert_result(Ok(pictures)).unwrap();
+        assert_eq!(frames.iter().map(|frame| frame.pts).collect::<Vec<_>>(), timestamps);
+        assert!(frames.iter().all(|frame| frame.frame.width == width && frame.frame.height == height));
+        assert!(
+            frames
+                .iter()
+                .all(|frame| matches!(&frame.frame.data, filmcraft_frame::PixelData::Yuv8 { planes, .. } if planes[0].iter().all(|sample| *sample == u8::MAX)))
+        );
     }
 }
 
