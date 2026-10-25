@@ -224,7 +224,8 @@ fn gpu_matches_cpu_plan() {
         1.0,
         24,
         filmcraft_time::FrameRate::FPS_24,
-    );
+    )
+    .unwrap();
     let rgba = Arc::new(VideoFrame::rgba8(320, 180, pixels));
     let (w, h) = (320usize, 180usize);
     let plan = FramePlan::Layers {
@@ -572,7 +573,8 @@ fn gpu_draws_yuv_alpha_plane_like_the_cpu() {
         1.0,
         24,
         filmcraft_time::FrameRate::FPS_24,
-    );
+    )
+    .unwrap();
     let background = Arc::new(VideoFrame::rgba8(320, 180, pixels));
     for bits in [8, 10, 12] {
         let mut c = GpuCompositor::new(&dev, &q);
