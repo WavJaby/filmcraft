@@ -6,6 +6,7 @@ use filmcraft_render::plan::execute_cpu;
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    eprintln!("GPU test adapter: {:?}", adapter.get_info());
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
 }
 
@@ -37,6 +38,45 @@ impl filmcraft_frame::GpuSurface for CacheSurface {
 fn import_cache_surface(surface: &dyn filmcraft_frame::GpuSurface, _: &wgpu::Device) -> Result<ImportedPlanes, String> {
     let s = surface.as_any().downcast_ref::<CacheSurface>().ok_or("wrong test surface")?;
     Ok(ImportedPlanes { luma: s.luma.clone(), chroma: s.chroma.clone(), keepalive: Box::new(()) })
+}
+
+#[test]
+fn cpu_and_gpu_source_ids_do_not_alias() {
+    let Some((dev, queue)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    set_surface_importer(import_cache_surface);
+    // 2x2: smallest complete NV12 chroma cell, matching CacheSurface::size.
+    let (width, height) = (2, 2);
+    let pixels = Arc::new(vec![0; width as usize * height as usize * 4]);
+    let id = Arc::as_ptr(&pixels) as *const u8 as usize as u64;
+    let texture = |width, height, format| {
+        dev.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cache-identity-test"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    };
+    let cpu = VideoFrame { width, height, data: PixelData::Rgba8(pixels), color: filmcraft_color::ColorInfo::REC709, par: (1, 1), pts: Default::default() };
+    let surface = Arc::new(CacheSurface {
+        id,
+        luma: texture(width, height, wgpu::TextureFormat::R8Unorm),
+        chroma: texture(width / 2, height / 2, wgpu::TextureFormat::Rg8Unorm),
+    });
+    let gpu = VideoFrame { data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface, Chroma::C420, 8)), ..cpu.clone() };
+    let mut compositor = GpuCompositor::new(&dev, &queue);
+    let cpu_key = compositor.upload(&cpu, None).unwrap();
+    let gpu_key = compositor.upload(&gpu, None).unwrap();
+    assert_ne!(cpu_key, gpu_key, "CPU allocations and GPU surfaces have separate identity namespaces");
+    assert_eq!(compositor.upload(&gpu, None).unwrap(), gpu_key);
+    assert_eq!(compositor.uploads[&gpu_key].kind, 3, "the GPU key must retain imported planes");
+    assert_eq!(compositor.uploads[&cpu_key].kind, 0, "the CPU key must retain its RGBA upload");
 }
 
 #[test]
@@ -370,7 +410,8 @@ fn gpu_matches_cpu_plan() {
         1.0,
         24,
         filmcraft_time::FrameRate::FPS_24,
-    );
+    )
+    .unwrap();
     let rgba = Arc::new(VideoFrame::rgba8(320, 180, pixels));
     let (w, h) = (320usize, 180usize);
     let plan = FramePlan::Layers {
@@ -718,7 +759,8 @@ fn gpu_draws_yuv_alpha_plane_like_the_cpu() {
         1.0,
         24,
         filmcraft_time::FrameRate::FPS_24,
-    );
+    )
+    .unwrap();
     let background = Arc::new(VideoFrame::rgba8(320, 180, pixels));
     for bits in [8, 10, 12] {
         let mut c = GpuCompositor::new(&dev, &q);

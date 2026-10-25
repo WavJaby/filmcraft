@@ -4,6 +4,7 @@
 //! Skips without ffmpeg, a DX12 adapter that is the decoder's adapter, or a hardware decoder.
 #![cfg(target_os = "windows")]
 
+#[path = "it/common/mod.rs"]
 mod common;
 
 use std::sync::{Arc, Mutex};
@@ -58,7 +59,7 @@ fn render(c: &mut GpuCompositor, frame: &Arc<VideoFrame>) -> Vec<u8> {
 
 #[test]
 fn gpu_pictures_composite_like_uploaded_ones_and_read_back_exactly() {
-    let _guard = ZERO_COPY_GATE.lock().unwrap();
+    let _guard = ZERO_COPY_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let ff = filmcraft_testkit::require_ffmpeg!();
     let Some((device, queue)) = dx12() else {
         eprintln!("SKIPPED: no DX12 device with DXC (set FILMCRAFT_DXC_DIR)");
@@ -135,7 +136,7 @@ fn gpu_pictures_composite_like_uploaded_ones_and_read_back_exactly() {
 /// Vulkan keeps new pictures on CPU; existing resident pictures must materialize and upload.
 #[test]
 fn vulkan_keeps_cpu_decode_and_materializes_resident_frames() {
-    let _guard = ZERO_COPY_GATE.lock().unwrap();
+    let _guard = ZERO_COPY_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::VULKAN, ..wgpu::InstanceDescriptor::new_without_display_handle() });
     let Some((device, queue)) =
         pollster::block_on(instance.request_adapter(&Default::default())).ok().and_then(|a| pollster::block_on(a.request_device(&Default::default())).ok())
@@ -197,7 +198,7 @@ fn vulkan_keeps_cpu_decode_and_materializes_resident_frames() {
 /// Decoder replacement must not accumulate imported surfaces in a persistent compositor.
 #[test]
 fn imported_surfaces_are_evicted_and_released_with_the_compositor() {
-    let _guard = ZERO_COPY_GATE.lock().unwrap();
+    let _guard = ZERO_COPY_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let ff = filmcraft_testkit::require_ffmpeg!();
     let Some((device, queue)) = dx12() else {
         eprintln!("SKIPPED: no DX12 device with DXC (set FILMCRAFT_DXC_DIR)");
@@ -252,7 +253,7 @@ fn imported_surfaces_are_evicted_and_released_with_the_compositor() {
 /// Controlled renderer destruction, not driver reset or application recovery.
 #[test]
 fn resident_pictures_survive_renderer_device_replacement() {
-    let _guard = ZERO_COPY_GATE.lock().unwrap();
+    let _guard = ZERO_COPY_GATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let ff = filmcraft_testkit::require_ffmpeg!();
     let Some((device, queue)) = dx12() else {
         eprintln!("SKIPPED: no DX12 device with DXC (set FILMCRAFT_DXC_DIR)");

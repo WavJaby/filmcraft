@@ -1,51 +1,31 @@
 # ADR 0002: resident Windows decode frames through D3D11 / wgpu DX12
 
-- **Status:** proposed; extends the unsafe boundary in [ADR 0001](0001-platform-ffi.md), subject to owner approval
-- **Origin:** [PR #152](https://github.com/storytold/filmcraft/pull/152), adapted by [PR #462](https://github.com/storytold/filmcraft/pull/462)
-- **Issue:** [#30](https://github.com/storytold/filmcraft/issues/30)
-
-## Context
-
-Media Foundation decodes NV12/P010 into D3D11 surfaces. CPU-only output requires staging readback and planar conversion; GPU preview then uploads those pixels again. The proposed path removes that CPU round trip when the compositor can share the decoder adapter's memory. It still performs a GPU-to-GPU copy into a shareable texture; “zero-copy” here means no CPU pixel transfer on the successful import path.
+- Status: proposed; extends the FFI boundary in [ADR 0001](0001-platform-ffi.md), subject to owner approval
+- Origin: [PR #152](https://github.com/storytold/filmcraft/pull/152), adapted by [PR #462](https://github.com/storytold/filmcraft/pull/462) and [PR #1021](https://github.com/storytold/filmcraft/pull/1021)
+- Issue: [#30](https://github.com/storytold/filmcraft/issues/30)
 
 ## Decision
 
-1. Keep the frame contract independent of OS/wgpu types. `PixelData::Gpu(GpuPixels)` owns `Arc<dyn GpuSurface>`; `VideoFrame::cpu` preserves metadata and shares one cached download result across clones. Conversions and transforms return `Result`; preview, render/effects, export and analysis propagate terminal failures instead of substituting gray pixels. This shared API is a prerequisite PR; it introduces no Windows interop or backend policy.
-2. `media_foundation::Decoder::share` copies the eligible cropped picture into an independent shareable D3D11 NV12/P010 texture. The decoder waits for GPU copy completion before exposing it. Even, nonzero 4:2:0 geometry and supported size are required; ineligible geometry retains the existing CPU readback path.
-3. `SharedSurface` records its creating adapter's LUID; `media_foundation::interop::import` checks that identity against the target DX12 device on each import before opening the NT handle. It wraps luma/chroma as wgpu textures: R8Unorm/Rg8Unorm for NV12, R16Unorm/Rg16Unorm for P010. The compositor importer retains the planes and surface owner while cached. Imported and uploaded sources use the same compositor, effects, transitions and YUV range math; there is no second renderer.
-4. Select DX12 only when DXC libraries are available and compositor construction succeeds. Respect explicit backend overrides; `FILMCRAFT_NO_ZERO_COPY=1` retains normal renderer selection. `FILMCRAFT_DXC_DIR` or the executable directory supplies `dxcompiler.dll`/`dxil.dll`; bundling them remains a packaging decision. Enable resident decode only after same-adapter DX12 compatibility is established.
+Media Foundation returns NV12/P010 D3D11 textures. Copy eligible cropped pictures into independent shareable textures, wait for copy completion, then open their NT handles on a compatible wgpu DX12 device. This removes the CPU readback/upload round trip; a GPU-to-GPU copy remains. Unsupported geometry or sharing retains CPU output.
 
-## Unsafe boundary and ownership
+The shared frame API owns `Arc<dyn GpuSurface>` through `GpuPixels`; fallible CPU materialization is cached across clones. OS/wgpu types stay outside that contract. CPU render, analysis and export propagate materialization errors; failed frames must not become successful cache entries or substitute pixels.
 
-Only `crates/platform/src/media_foundation/interop.rs` extends the FFI allowlist. It creates shared D3D11 resources/handles, reads adapter LUID, opens D3D12 resources and wraps them through wgpu HAL. Existing `gpu`/`mft` modules retain their OS media roles. Every unsafe block requires its own safety argument; public APIs remain safe and return errors.
+`media_foundation::interop::import` checks the surface's adapter LUID against the actual target device on every import. NV12 uses R8Unorm/Rg8Unorm planes; P010 uses R16Unorm/Rg16Unorm and requires `TEXTURE_FORMAT_16BIT_NORM`. Imported sources use the existing compositor, effects and YUV math. Tagged CPU allocation / GPU surface identities prevent cache aliasing; the existing source-cache bound applies to both.
 
-`SharedSurface` owns its D3D11 texture and closes its NT handle once on drop. Imported D3D12 resources hold COM references; the importer also retains `Arc<SharedSurface>`. The D3D11 device is multithread protected; completed copies precede cross-device reads. wgpu owns the HAL wrappers and tracks compositor submissions. Resource-state, format/plane, thread-safety and queued-use assumptions require review against the actual `interop` implementation; this ADR does not replace that review.
+Only normal startup may select DX12, after both DXC libraries are found and compositor construction succeeds. Respect explicit backend overrides and recovery modes. `FILMCRAFT_NO_ZERO_COPY=1` retains normal renderer selection; `FILMCRAFT_DXC_DIR` or the executable directory supplies dxcompiler.dll/dxil.dll. Packaging those libraries remains a separate decision. Enable resident decode only after the active compositor's device passes the same-adapter check.
 
-## Failure contract
+## Ownership and failures
 
-- Unsupported renderer/adapter/geometry keeps CPU decode output. A share failure disables sharing for that decoder stream and attempts the existing readback path.
-- Copy-completion failure returns a decoder error from decode or flush; the failed batch is not published. The hybrid decoder replays buffered samples in software or reports failure when replay cannot complete.
-- Import failure logs the cause and tries the picture's cached CPU materialization/upload. Materialization failure remains an error; it must not enter successful frame caches or encoder input.
-- P010 import requires `TEXTURE_FORMAT_16BIT_NORM` on the renderer device; missing support returns an import error before HAL wrapping. NV12 remains eligible on that device.
-- Disabling the compositor stops new GPU pictures. Existing pictures retain their owners and may still require a download; failure must be reported without losing project edits. Hardware-to-software decoder replay remains the hybrid decoder's separate responsibility.
+`media_foundation::interop` is the added unsafe FFI module: D3D11 shared resources/handles, adapter identity, D3D12 resource opening and wgpu HAL wrapping. Public APIs remain safe and return errors; each unsafe block states its invariants. Decoder policy and `MfSurface` stay safe Rust.
 
-Controlled device-loss tests pass: `crates/platform/tests/zero_copy.rs::resident_pictures_survive_renderer_device_replacement` destroys the renderer device, observes its loss callback and reimports retained decoded pictures on a replacement DX12 device with exact output and no CPU upload. `crates/ui-egui/src/lib.rs::gpu_fallback_tests::destroyed_device_program_monitor_outputs_changed_cpu_frames` verifies changed Program-monitor output through CPU fallback after device destruction. These gates do not cover physical driver reset, loss of the decoder's D3D11 device or full-window playback/export recovery. The original proposal's “never lose a picture” wording remains a goal.
+`SharedSurface` owns the D3D11 texture and closes its NT handle once. Imported D3D12 resources retain COM references; cached planes also retain the surface owner. The D3D11 device is multithread protected and completed copies precede cross-device reads. Resource state, plane format and queued-use ownership remain part of the interop safety contract.
+
+A share failure disables sharing for that decoder and attempts CPU readback. A copy-completion failure returns a decoder error without publishing the batch; the hybrid decoder replays buffered samples in software or reports terminal failure. Import failure tries cached CPU materialization/upload; materialization failure remains an error. Disabling the compositor stops new resident output; existing frames retain their owners and fallible download path.
 
 ## Cost and acceptance
 
-GPU-resident pictures retain texture memory and an NT handle; CPU consumers additionally pay a download and retain its cached result. Imported-source eviction and GOP/frame-plan budgets limit parts of this ownership graph, but do not prove a sustained total-memory bound. Surface pooling is excluded until cross-device queued use can be tracked safely.
+Resident pictures retain GPU memory and handles; CPU consumers additionally retain downloaded planes. Bounded compositor caching and frame/GOP budgets constrain parts of this graph, not total memory. Pooling surfaces requires explicit cross-device queued-use tracking and is outside this decision.
 
-## Verification scope
+`tests/zero_copy.rs` remains an independent test binary because decoder policy and surface counters are process-wide. It covers decoded-plane/compositor parity, Vulkan materialization fallback, cache eviction/release and controlled renderer replacement. Its CPU reference explicitly downloads planes, so it does not measure a download-free workload. UI/export device-destruction tests separately check changed output through CPU fallback. These are unit/selftest and isolated runtime gates, not physical driver reset or full-window recovery evidence.
 
-Static/configuration and unit/selftest gates pass at Windows integration `a9a5b69683ca18371b19dd404cc3d1f1233258b7`, based on main `cee1feb185e675a108f78067f71ad86a640ace3d`. Isolated runtime on GTX 1080 Ti / DX12 covers original-plane and compositor parity for H.264 High, HEVC Main and Main10, Vulkan CPU fallback, imported-source eviction/release and controlled renderer replacement. The parity tests explicitly download CPU reference planes; they do not measure a download-free workload. See [#1021 validation](https://github.com/storytold/filmcraft/pull/1021#issuecomment-6146112723) for commands and limits.
-
-Earlier real new-session lifecycle evidence at `22a0834185b` covers 60 playback/seek cycles over 350 seconds with two 1080p H.264 clips, a Push transition and periodic project reopening. Observed resource bands and final decoder/source release support that workload only; they are not a total-memory cap or a lifecycle rerun on the current integration.
-
-## Remaining acceptance gates
-
-- Green `cargo xtask ci` on the integrated revision. Scoped checks and packaging success do not replace this gate; the prior exact-main comparison still failed strict Clippy.
-- Physical driver/decoder-device loss and full-window recovery: playback must advance, export must complete or return a terminal error, and project edits must survive.
-- Current-integration sustained playback/seek/transition/cache-eviction runs with responsive memory/handle/surface counters and final-release checks; characterize retained allocations separately from leaks. Existing finite runs do not prove indefinite bounds.
-- Revalidate affected seams after newer upstream merges. Results pinned to `cee1feb1` do not validate later main revisions.
-
-Performance results must identify hardware, build, workload and measured bands. This ADR covers Windows interop; it provides no WebCodecs runtime or Web performance evidence.
+Acceptance also requires integrated quality gates, same-adapter hardware execution without required-case skips, and sustained playback/seek/transition runs with responsive memory/handle/surface counters and final-release checks. Physical decoder-device loss, driver reset and preservation of project edits need separate lifecycle validation. Results must name the tested revision, hardware and workload; finite runs do not establish an indefinite memory bound. This Windows contract provides no WebCodecs or Web performance evidence.

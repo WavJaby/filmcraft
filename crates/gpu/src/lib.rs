@@ -75,6 +75,15 @@ pub fn set_surface_importer(f: SurfaceImporter) {
     let _ = IMPORTER.set(f);
 }
 
+// Surface IDs are unique among surfaces, not disjoint from CPU allocation addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum SourceId {
+    Cpu(usize),
+    Gpu(u64),
+}
+
+type SourceKey = (SourceId, u32, u32);
+
 struct Uploaded {
     /// Y, Cb, Cr (or the RGBA texture) and the alpha plane (the dummy texture when there is none).
     views: [wgpu::TextureView; 4],
@@ -84,8 +93,7 @@ struct Uploaded {
     alpha_scale: f32,
     chroma: (u32, u32),
     last_used: u64,
-    /// The uploaded pixel buffers, kept alive while cached: the cache key is the buffer address,
-    /// and a freed buffer's address can be reused by a different frame (stale texture).
+    /// Keep source owners alive; freed CPU addresses may be reused while textures remain cached.
     _pixels: PixelData,
     /// Keeps imported (zero-copy) planes' memory alive.
     _keep: Option<Box<dyn std::any::Any + Send + Sync>>,
@@ -106,7 +114,7 @@ pub struct GpuCompositor {
     backdrop: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
     output: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
     accum_readback_buf: Option<(wgpu::Buffer, u64)>,
-    uploads: HashMap<(usize, u32, u32), Uploaded>,
+    uploads: HashMap<SourceKey, Uploaded>,
     clock: u64,
     dummy: wgpu::TextureView,
     /// The effect stage (None on devices without compute shaders or storage textures: layers
@@ -502,13 +510,13 @@ impl GpuCompositor {
     }
 
     /// Upload (or reuse) the textures of a frame, using `prep` when it was converted beforehand.
-    fn upload(&mut self, f: &VideoFrame, prep: Option<&Prepared>) -> Result<(usize, u32, u32), String> {
+    fn upload(&mut self, f: &VideoFrame, prep: Option<&Prepared>) -> Result<SourceKey, String> {
         let id = match &f.data {
-            PixelData::Rgba8(d) => Arc::as_ptr(d) as *const u8 as usize,
-            PixelData::RgbaF32(d) => Arc::as_ptr(d) as *const u8 as usize,
-            PixelData::Yuv8 { planes, .. } => Arc::as_ptr(&planes[0]) as *const u8 as usize,
-            PixelData::Yuv16 { planes, .. } => Arc::as_ptr(&planes[0]) as *const u8 as usize,
-            PixelData::Gpu(g) => g.surface().id() as usize,
+            PixelData::Rgba8(d) => SourceId::Cpu(Arc::as_ptr(d) as *const u8 as usize),
+            PixelData::RgbaF32(d) => SourceId::Cpu(Arc::as_ptr(d) as *const u8 as usize),
+            PixelData::Yuv8 { planes, .. } => SourceId::Cpu(Arc::as_ptr(&planes[0]) as *const u8 as usize),
+            PixelData::Yuv16 { planes, .. } => SourceId::Cpu(Arc::as_ptr(&planes[0]) as *const u8 as usize),
+            PixelData::Gpu(g) => SourceId::Gpu(g.surface().id()),
         };
         let key = (id, f.width, f.height);
         self.clock += 1;
@@ -624,10 +632,10 @@ impl GpuCompositor {
         Ok(key)
     }
 
-    fn cache_source(&mut self, key: (usize, u32, u32), up: Uploaded) {
+    fn cache_source(&mut self, key: SourceKey, up: Uploaded) {
         self.uploads.insert(key, up);
         if self.uploads.len() > SOURCE_CACHE_CAPACITY {
-            let mut v: Vec<(u64, (usize, u32, u32))> = self.uploads.iter().map(|(k, u)| (u.last_used, *k)).collect();
+            let mut v: Vec<(u64, SourceKey)> = self.uploads.iter().map(|(k, u)| (u.last_used, *k)).collect();
             v.sort_unstable();
             for (_, k) in v.into_iter().take(self.uploads.len() - SOURCE_CACHE_CAPACITY) {
                 self.uploads.remove(&k);
@@ -660,7 +668,7 @@ impl GpuCompositor {
     }
 
     /// The source description of an uploaded frame.
-    fn src_info(&self, f: &VideoFrame, key: (usize, u32, u32)) -> Option<SrcInfo> {
+    fn src_info(&self, f: &VideoFrame, key: SourceKey) -> Option<SrcInfo> {
         let up = self.uploads.get(&key)?;
         let code_levels = match &f.data {
             PixelData::Yuv8 { .. } => 256.0,
@@ -828,7 +836,7 @@ impl GpuCompositor {
             .collect::<Result<Vec<_>, String>>()?;
         let resolved: Vec<&PlanLayer> = layers.iter().zip(&cpu_fx).map(|(l, c)| c.as_ref().unwrap_or(l)).collect();
         let layers = resolved;
-        let keys: Vec<(usize, u32, u32)> = layers
+        let keys: Vec<SourceKey> = layers
             .iter()
             .enumerate()
             .map(|(i, l)| {

@@ -210,6 +210,7 @@ impl VideoFrame {
     /// and bit depth unchanged. Reduced-resolution playback hands the GPU this instead of the full
     /// picture (a quarter / sixteenth of the upload). None for RGBA frames or `n` < 2.
     pub fn box_decimated(&self, n: usize) -> Option<VideoFrame> {
+        let n = self.bounded_decimation(n);
         if n < 2 {
             return None;
         }
@@ -365,7 +366,7 @@ impl VideoFrame {
         if matches!(self.data, PixelData::Gpu(_)) {
             return self.cpu()?.to_linear_f32_decimated_with(n, decode);
         }
-        let n = n.max(1);
+        let n = self.bounded_decimation(n);
         let (ow, oh) = self.decimated_size(n);
         // every element is written below, so a recycled buffer needs no zero-fill
         let mut out = pool::take_f32_overwritten(ow * oh * 4);
@@ -375,7 +376,7 @@ impl VideoFrame {
 
     /// The size of the picture after `n`×`n` box decimation.
     pub fn decimated_size(&self, n: usize) -> (usize, usize) {
-        let n = n.max(1);
+        let n = self.bounded_decimation(n);
         ((self.width as usize / n).max(1), (self.height as usize / n).max(1))
     }
 
@@ -387,7 +388,7 @@ impl VideoFrame {
         if matches!(self.data, PixelData::Gpu(_)) {
             return self.cpu()?.to_linear_f32_region(n, decode, region);
         }
-        let n = n.max(1);
+        let n = self.bounded_decimation(n);
         let (ow, oh) = self.decimated_size(n);
         let r = region.clip(ow, oh);
         let mut out = pool::take_f32_overwritten(r.w * r.h * 4);
@@ -409,6 +410,7 @@ impl VideoFrame {
             out.fill(0.0);
             return Ok(());
         }
+        let n = n.min(w.max(h)).max(1);
         if let PixelData::RgbaF32(d) = &self.data
             && n == 1
         {
@@ -429,7 +431,7 @@ impl VideoFrame {
             Some(t) => t.lookup(v),
             None => lin[(v.clamp(0.0, 1.0) * 4095.0 + 0.5) as usize],
         };
-        let inv = 1.0 / (n * n) as f32;
+        let inv = 1.0 / (n as f32 * n as f32);
         match &self.data {
             // (a GPU picture was handled above, through its CPU copy)
             PixelData::Gpu(_) => return Err("GPU surface was not materialized".into()),
@@ -528,6 +530,13 @@ impl VideoFrame {
                 let cw = w.div_ceil(1 << sx);
                 let bits = *bits;
                 let amax = ((1u32 << bits) - 1) as f32;
+                // Per-code tables (exactly the values `normalize_*` returns) instead of two
+                // divisions per sample; a code past the table (a corrupt plane) is computed.
+                let codes = if bits <= 12 { 1usize << bits } else { 0 };
+                let ytab: Vec<f32> = (0..codes as u32).map(|v| normalize_y(v, bits, info.range)).collect();
+                let ctab: Vec<f32> = (0..codes as u32).map(|v| normalize_c(v, bits, info.range)).collect();
+                let ny = |v: u16| ytab.get(usize::from(v)).copied().unwrap_or_else(|| normalize_y(u32::from(v), bits, info.range));
+                let nc = |v: u16| ctab.get(usize::from(v)).copied().unwrap_or_else(|| normalize_c(u32::from(v), bits, info.range));
                 out.par_chunks_mut(r.w * 4).enumerate().for_each(|(ry, row)| {
                     let oy = r.y + ry;
                     for rx in 0..r.w {
@@ -539,9 +548,9 @@ impl VideoFrame {
                             for dx in 0..n {
                                 let x = (ox * n + dx).min(w - 1);
                                 let cx = x >> sx;
-                                let yy = normalize_y(planes[0][y * w + x] as u32, bits, info.range);
-                                let u = normalize_c(planes[1][cy * cw + cx] as u32, bits, info.range);
-                                let v = normalize_c(planes[2][cy * cw + cx] as u32, bits, info.range);
+                                let yy = ny(planes[0][y * w + x]);
+                                let u = nc(planes[1][cy * cw + cx]);
+                                let v = nc(planes[2][cy * cw + cx]);
                                 let rgb = ycbcr_to_rgb(yy, u, v, info.matrix);
                                 let a = alpha.as_ref().map_or(1.0, |al| al[y * w + x] as f32 / amax);
                                 acc[0] += q(rgb[0]) * a;
@@ -566,7 +575,7 @@ impl VideoFrame {
     /// or its alpha is not stored as integers), so nothing can be skipped. Pixels outside the
     /// rectangle have alpha exactly 0 and, in the premultiplied conversion, colour 0 as well.
     pub fn alpha_region(&self, n: usize) -> Option<Region> {
-        let n = n.max(1);
+        let n = self.bounded_decimation(n);
         let (w, h) = (self.width as usize, self.height as usize);
         let px = w.checked_mul(h)?;
         // the first and last x of non-transparent pixels in source row `y`
@@ -589,6 +598,12 @@ impl VideoFrame {
         let (rx0, ry0) = (x0 / n, y0 / n);
         let (rx1, ry1) = (x1 / n + 1, y1 / n + 1);
         Some(Region { x: rx0, y: ry0, w: rx1.saturating_sub(rx0), h: ry1.saturating_sub(ry0) }.clip(ow, oh))
+    }
+
+    /// Keep hostile decimation requests from doing work beyond the source picture.  Larger boxes
+    /// only resample the edge pixels, so clamping them has no useful effect on the reduced output.
+    fn bounded_decimation(&self, n: usize) -> usize {
+        n.clamp(1, (self.width as usize).max(self.height as usize).max(1))
     }
 
     /// Convert to straight-alpha sRGB RGBA8 for display (fast paths for 8-bit sources).
@@ -1003,6 +1018,24 @@ mod tests {
         assert_eq!(&planes[2][..], &[200, 200]);
         assert!(f.box_decimated(1).is_none());
         assert!(VideoFrame::rgba8(2, 2, vec![0; 16]).box_decimated(2).is_none());
+    }
+
+    #[test]
+    fn decimation_caps_hostile_factors_to_the_frame_size() {
+        let rgba = VideoFrame::rgba8(1, 1, vec![23, 42, 99, 255]);
+        let (w, h, pixels) = rgba.to_linear_f32_decimated(usize::MAX).unwrap();
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(pixels, rgba.to_linear_f32().unwrap());
+
+        let yuv = VideoFrame {
+            width: 2,
+            height: 2,
+            data: PixelData::Yuv8 { planes: [Arc::new(vec![1, 2, 3, 4]), Arc::new(vec![128]), Arc::new(vec![128])], chroma: Chroma::C420, alpha: None },
+            color: ColorInfo::REC709,
+            par: (1, 1),
+            pts: Tick::ZERO,
+        };
+        assert_eq!(yuv.box_decimated(usize::MAX).expect("yuv").luma8().unwrap(), vec![3]);
     }
     use super::*;
 

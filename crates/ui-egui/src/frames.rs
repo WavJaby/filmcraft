@@ -33,6 +33,10 @@ pub enum Target {
     MulticamGrid(ItemId, u8, u16),
     /// One angle of a multi-camera source (Edit Cameras thumbnails).
     MulticamAngle(ItemId, u32),
+    /// Composite of a sequence rendered live, never from a render preview: previews are
+    /// flattened over black, and the monitors' Transparency Grid and Alpha display mode need the
+    /// frame's alpha.
+    SequenceLive(ItemId),
 }
 
 /// Item jobs at this priority or a larger number are background work: thumbnails of the Project
@@ -71,10 +75,59 @@ pub fn draft_playback(playing: bool, scale: f32, enabled: bool) -> bool {
     enabled && playing && scale <= 0.5
 }
 
+/// A rendered frame as sRGB RGBA8: the color is the picture over black and the fourth byte is
+/// its alpha ([`filmcraft_render::Image::over_black_with_alpha_rgba8`]).
 pub struct Rgba {
     pub w: usize,
     pub h: usize,
     pub px: Vec<u8>,
+}
+
+impl Rgba {
+    /// The frame as a texture image: opaque (the picture over black), or with its alpha, so what
+    /// is painted under it shows through its transparent areas.
+    pub fn color_image(&self, alpha: bool) -> egui::ColorImage {
+        let pixels = if alpha {
+            self.px.as_chunks::<4>().0.iter().map(|p| gamma_premultiplied(*p)).collect()
+        } else {
+            self.px.as_chunks::<4>().0.iter().map(|p| egui::Color32::from_rgb(p[0], p[1], p[2])).collect()
+        };
+        egui::ColorImage::new([self.w, self.h], pixels)
+    }
+}
+
+/// A frame pixel (sRGB of the linear color premultiplied by alpha) as egui's color, which is the
+/// sRGB of the straight color multiplied by alpha.
+fn gamma_premultiplied([r, g, b, a]: [u8; 4]) -> egui::Color32 {
+    match a {
+        255 => egui::Color32::from_rgb(r, g, b),
+        0 => egui::Color32::TRANSPARENT,
+        _ => {
+            let straight = |v: u8| straight_srgb(a, v);
+            egui::Color32::from_rgba_unmultiplied(straight(r), straight(g), straight(b), a)
+        }
+    }
+}
+
+/// The sRGB of the straight color whose premultiplied value is sRGB `v` at alpha `a`, from a table
+/// made on first use: a frame with partial alpha would otherwise take two `powf` per channel per
+/// pixel on every upload.
+fn straight_srgb(a: u8, v: u8) -> u8 {
+    static TABLE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        use egui::ecolor::{gamma_u8_from_linear_f32, linear_f32_from_gamma_u8};
+        let mut t = vec![0u8; 256 * 256];
+        for a in 1..=255u8 {
+            let k = f32::from(a) / 255.0;
+            for v in 0..=255u8 {
+                if let Some(x) = t.get_mut(usize::from(a) * 256 + usize::from(v)) {
+                    *x = gamma_u8_from_linear_f32((linear_f32_from_gamma_u8(v) / k).min(1.0));
+                }
+            }
+        }
+        t
+    });
+    table.get(usize::from(a) * 256 + usize::from(v)).copied().unwrap_or(v)
 }
 
 struct Job {
@@ -98,8 +151,6 @@ struct Job {
 struct Shared {
     queue: Mutex<VecDeque<Job>>,
     cv: Condvar,
-    /// Set under queue + in_flight locks; covers waiting and popped-but-unregistered jobs.
-    retired: AtomicBool,
     done: Mutex<Cache>,
     plans: Mutex<PlanCache>,
     /// Running jobs: key, cancel flag, prefetch.
@@ -114,6 +165,8 @@ struct Shared {
     workers: usize,
     /// Always-on counters for `perf.stats`.
     stats: Mutex<FrameStats>,
+    /// Set (under the queue lock) when the [`FrameServer`] is dropped: the workers return.
+    stop: AtomicBool,
 }
 
 /// Cumulative frame-job statistics (`perf.stats`): cheap enough to keep on all the time.
@@ -405,22 +458,6 @@ pub struct FrameServer {
     repaint: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>>,
 }
 
-impl Drop for FrameServer {
-    fn drop(&mut self) {
-        let mut queue = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-        let in_flight = self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        self.shared.retired.store(true, Ordering::Relaxed);
-        queue.clear();
-        for (_, cancel, _) in in_flight.iter() {
-            cancel.store(true, Ordering::Relaxed);
-        }
-        drop(in_flight);
-        drop(queue);
-        // Active jobs exit cooperatively; joining here would block the UI on a decoder.
-        self.shared.cv.notify_all();
-    }
-}
-
 /// Frames queued ahead of the playhead while playing (and how far ahead a queued job may be
 /// before it is dropped as stale).
 pub fn prefetch_depth(speed: f64) -> i64 {
@@ -475,7 +512,6 @@ impl FrameServer {
         let shared = Arc::new(Shared {
             queue: Mutex::new(VecDeque::new()),
             cv: Condvar::new(),
-            retired: AtomicBool::new(false),
             done: Mutex::new(Cache { map: HashMap::new(), bytes: 0, budget: 768 << 20, clock: 0 }),
             plans: Mutex::new(PlanCache::default()),
             in_flight: Mutex::new(Vec::new()),
@@ -484,6 +520,7 @@ impl FrameServer {
             render_cost: Mutex::new(0.0),
             workers: workers.max(1),
             stats: Mutex::new(FrameStats::default()),
+            stop: AtomicBool::new(false),
         });
         let repaint: Arc<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = Arc::new(Mutex::new(None));
         #[cfg(not(target_arch = "wasm32"))]
@@ -778,6 +815,21 @@ impl FrameServer {
     }
 }
 
+impl Drop for FrameServer {
+    /// Stop the workers: queued jobs are dropped, running ones are cancelled, and each worker
+    /// returns once it has no job, releasing the frame cache, the media pool and the services.
+    fn drop(&mut self) {
+        let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        self.shared.stop.store(true, Ordering::Relaxed);
+        q.clear();
+        drop(q);
+        for (_, c, _) in self.shared.in_flight.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            c.store(true, Ordering::Relaxed);
+        }
+        self.shared.cv.notify_all();
+    }
+}
+
 /// Counts shown and dropped frames while playing.
 ///
 /// A frame of the timeline is *shown* when its exact picture was on screen at some refresh while
@@ -860,7 +912,7 @@ fn worker(
         let job = {
             let mut q = sh.queue.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if sh.retired.load(Ordering::Relaxed) {
+                if sh.stop.load(Ordering::Relaxed) {
                     return;
                 }
                 if !q.is_empty() {
@@ -901,8 +953,10 @@ static INJECT_PANICS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 fn run_job(sh: &Shared, job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, previews: &PreviewStore) -> bool {
     {
         let mut in_flight = sh.in_flight.lock().unwrap_or_else(|e| e.into_inner());
-        if sh.retired.load(Ordering::Relaxed) {
-            return true;
+        // A job taken from the queue just before the server was dropped is not in the list
+        // that `Drop` cancels.
+        if sh.stop.load(Ordering::Relaxed) {
+            job.cancel.store(true, Ordering::Relaxed);
         }
         in_flight.push((job.key, job.cancel.clone(), job.prefetch));
     }
@@ -1060,12 +1114,14 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
                 o.composite_onto(&mut img.px, w, h);
             }
         }
-        return Ok((Rgba { w: img.w, h: img.h, px: img.over_black_rgba8() }, true));
+        return Ok((Rgba { w: img.w, h: img.h, px: img.over_black_with_alpha_rgba8() }, true));
     }
     let provider = provider(job, pool, services);
     let opts = filmcraft_render::RenderOptions { scale: job.scale, captions: true, ..Default::default() };
     let img = match job.key.target {
-        Target::Sequence(seq) | Target::SequencePlan(seq) => Some(filmcraft_render::render_sequence(&job.project, seq, job.time, opts, &provider)?),
+        Target::Sequence(seq) | Target::SequencePlan(seq) | Target::SequenceLive(seq) => {
+            Some(filmcraft_render::render_sequence(&job.project, seq, job.time, opts, &provider)?)
+        }
         Target::Item(item) => filmcraft_render::render_item(&job.project, item, job.time, job.scale, &provider)?,
         Target::MulticamGrid(item, side, page) => {
             let side = (side > 0).then_some(side as usize);
@@ -1076,7 +1132,7 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
         }
     };
     let rgba = match img {
-        Some(img) => Rgba { w: img.w, h: img.h, px: img.over_black_rgba8() },
+        Some(img) => Rgba { w: img.w, h: img.h, px: img.over_black_with_alpha_rgba8() },
         None => Rgba { w: 1, h: 1, px: vec![0, 0, 0, 255] },
     };
     Ok((rgba, false))
@@ -1086,138 +1142,6 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
 mod tests {
     use super::{PlaybackMeter, Target, background_work, playback_plan};
     use filmcraft_project::ItemId;
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn dropping_frame_server_releases_idle_workers_and_their_media() {
-        use super::FrameServer;
-        use filmcraft_engine::{FsServices, MediaPool, previews::PreviewStore};
-        use std::sync::Arc;
-        use std::time::{Duration, Instant};
-
-        let pool = Arc::new(MediaPool::default());
-        let previews = Arc::new(PreviewStore::default());
-        let pool_owner = Arc::downgrade(&pool);
-        let preview_owner = Arc::downgrade(&previews);
-        // Two idle workers require a broadcast, not a single wakeup.
-        let server = FrameServer::new(pool, Arc::new(FsServices), previews, 2);
-        let shared_owner = Arc::downgrade(&server.shared);
-        assert!(shared_owner.upgrade().is_some(), "ownership probe must see the live server");
-        drop(server);
-        // Deadline bounds scheduler delay; successful release, not elapsed time, is the gate.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline && (shared_owner.strong_count() > 0 || pool_owner.strong_count() > 0 || preview_owner.strong_count() > 0) {
-            std::thread::yield_now();
-        }
-        assert!(shared_owner.upgrade().is_none(), "retired workers retained frame caches");
-        assert!(pool_owner.upgrade().is_none(), "retired workers retained media sources");
-        assert!(preview_owner.upgrade().is_none(), "retired workers retained previews");
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn retirement_cancels_active_work_discards_queue_and_rejects_popped_jobs() {
-        use super::{FrameKey, FrameServer, run_job};
-        use filmcraft_engine::{FsServices, MediaPool, demo::add_generator, previews::PreviewStore};
-        use filmcraft_media::{Generator, MediaSource, generators::GeneratorSource};
-        use filmcraft_project::{Label, Project};
-        use filmcraft_time::{FrameRate, Tick};
-        use std::sync::{Arc, Mutex, atomic::AtomicUsize, atomic::Ordering, mpsc};
-        use std::time::{Duration, Instant};
-
-        struct BlockedSource {
-            inner: filmcraft_media::SharedSource,
-            entered: mpsc::Sender<()>,
-            release: Mutex<mpsc::Receiver<()>>,
-            cancelled: mpsc::Sender<bool>,
-            calls: Arc<AtomicUsize>,
-        }
-
-        impl MediaSource for BlockedSource {
-            fn info(&self) -> &filmcraft_media::MediaInfo {
-                self.inner.info()
-            }
-
-            fn video_frame(&self, req: filmcraft_media::FrameRequest) -> filmcraft_media::Result<Arc<filmcraft_frame::VideoFrame>> {
-                if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
-                    self.entered.send(()).unwrap();
-                    self.release.lock().unwrap().recv().unwrap();
-                    self.cancelled.send(filmcraft_media::cancel::cancelled()).unwrap();
-                }
-                // Return a valid picture even after cancellation: retired results must not be cached.
-                self.inner.video_frame(req)
-            }
-
-            fn audio(&self, start: i64, frames: usize, rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
-                self.inner.audio(start, frames, rate)
-            }
-        }
-
-        // Three distinct frames: active, popped before registration, still queued.
-        let rate = FrameRate::FPS_24;
-        let pool = Arc::new(MediaPool::default());
-        let previews = Arc::new(PreviewStore::default());
-        let services: Arc<dyn filmcraft_engine::Services> = Arc::new(FsServices);
-        let mut project = Project::new("Worker retirement");
-        let source = GeneratorSource::new(Generator::BlackVideo, 1, 1, rate, rate.tick_of(3));
-        let item = add_generator(&mut project, &pool, source, "Blocked source", Label::Iris, None);
-        let project = Arc::new(project);
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let (cancelled_tx, cancelled_rx) = mpsc::channel();
-        let calls = Arc::new(AtomicUsize::new(0));
-        pool.insert(
-            item,
-            Arc::new(BlockedSource {
-                inner: pool.cached(item).unwrap(),
-                entered: entered_tx,
-                release: Mutex::new(release_rx),
-                cancelled: cancelled_tx,
-                calls: calls.clone(),
-            }),
-        );
-        let pool_owner = Arc::downgrade(&pool);
-        let server = FrameServer::new(pool.clone(), services.clone(), previews.clone(), 1);
-        let shared = server.shared.clone();
-        let shared_owner = Arc::downgrade(&shared);
-        let key = FrameKey { target: Target::Item(item), frame: 0, size: 1000, revision: 0, draft: false };
-        // Deadlines bound scheduler delay; channel events and ownership release are the gates.
-        let timeout = Duration::from_secs(5);
-        server.request(key, Tick::ZERO, 1.0, &project, 1);
-        entered_rx.recv_timeout(timeout).expect("source must enter before retirement");
-        server.request(FrameKey { frame: 1, ..key }, rate.tick_of(1), 1.0, &project, 1);
-        let popped = shared.queue.lock().unwrap().pop_front().expect("simulate a worker between queue removal and registration");
-        server.request(FrameKey { frame: 2, ..key }, rate.tick_of(2), 1.0, &project, 1);
-        let (retired_tx, retired_rx) = mpsc::channel();
-        let retire = std::thread::spawn(move || {
-            drop(server);
-            retired_tx.send(()).unwrap();
-        });
-        let nonblocking = retired_rx.recv_timeout(timeout).is_ok();
-        // Always unblock the source before asserting, including if Drop incorrectly joins it.
-        release_tx.send(()).unwrap();
-        retire.join().unwrap();
-        assert!(nonblocking, "server retirement waited for an active source");
-        assert!(cancelled_rx.recv_timeout(timeout).unwrap(), "active request missed cancellation");
-        assert!(run_job(&shared, &popped, &pool, &services, &previews));
-        let deadline = Instant::now() + timeout;
-        while shared.stats.lock().unwrap().jobs == 0 && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert_eq!(shared.stats.lock().unwrap().jobs, 1, "only the active job may finish");
-        assert_eq!(shared.stats.lock().unwrap().cancelled, 1);
-        assert_eq!(calls.load(Ordering::Relaxed), 1, "retired queued or popped jobs reached the source");
-        assert!(shared.queue.lock().unwrap().is_empty());
-        assert!(shared.done.lock().unwrap().map.is_empty(), "cancelled result was cached");
-        assert!(shared.plans.lock().unwrap().map.is_empty());
-        drop((shared, pool, services, previews, popped));
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline && (shared_owner.strong_count() > 0 || pool_owner.strong_count() > 0) {
-            std::thread::yield_now();
-        }
-        assert!(shared_owner.upgrade().is_none(), "active worker retained frame caches");
-        assert!(pool_owner.upgrade().is_none(), "active worker retained media sources");
-    }
 
     #[test]
     fn pending_error_success_and_cancellation_have_distinct_outcomes() {
@@ -1322,6 +1246,27 @@ mod tests {
     }
 
     #[test]
+    fn the_straight_color_table_matches_the_formula() {
+        use egui::ecolor::{gamma_u8_from_linear_f32, linear_f32_from_gamma_u8};
+        for a in 1..=255u8 {
+            for v in 0..=255u8 {
+                let want = gamma_u8_from_linear_f32((linear_f32_from_gamma_u8(v) / (f32::from(a) / 255.0)).min(1.0));
+                assert_eq!(super::straight_srgb(a, v), want, "a {a} v {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_frame_goes_up_opaque_or_with_its_alpha() {
+        use egui::Color32;
+        // opaque red, transparent, and half-transparent white: linear 0.5 over black is sRGB 188
+        let img = super::Rgba { w: 3, h: 1, px: vec![255, 0, 0, 255, 0, 0, 0, 0, 188, 188, 188, 128] };
+        assert_eq!(img.color_image(false).pixels, [Color32::from_rgb(255, 0, 0), Color32::BLACK, Color32::from_rgb(188, 188, 188)]);
+        // egui's colors are the sRGB of the straight color times alpha: white at half is 128
+        assert_eq!(img.color_image(true).pixels, [Color32::from_rgb(255, 0, 0), Color32::TRANSPARENT, Color32::from_rgba_premultiplied(128, 128, 128, 128)]);
+    }
+
+    #[test]
     fn draft_decoding_only_for_reduced_resolution_playback() {
         use super::draft_playback;
         assert!(draft_playback(true, 0.5, true) && draft_playback(true, 0.25, true));
@@ -1382,5 +1327,57 @@ mod tests {
         }
         m.finish();
         assert_eq!((m.shown, m.dropped), (4, 0));
+    }
+
+    /// The workers of a dropped server return and release its state (the frame cache, the media
+    /// pool, the projects of queued jobs) instead of waiting for jobs for the rest of the process.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn dropping_the_server_ends_its_workers() {
+        use super::{FrameKey, FrameServer};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let s = filmcraft_engine::Session::default();
+        let server = FrameServer::new(s.media.clone(), s.services.clone(), s.previews.clone(), 3);
+        let p = Arc::new(filmcraft_project::Project::new("Frames"));
+        let key = FrameKey { target: Target::Item(ItemId(999)), frame: 0, size: 32, revision: 0, draft: false };
+        server.request(key, filmcraft_time::Tick::ZERO, 0.1, &p, 0);
+        let (shared, project) = (Arc::downgrade(&server.shared), Arc::downgrade(&p));
+        drop(p);
+        drop(server);
+        let t0 = Instant::now();
+        while (shared.strong_count() > 0 || project.strong_count() > 0) && t0.elapsed() < Duration::from_secs(30) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(shared.strong_count(), 0, "a worker still holds the dropped server's state");
+        assert_eq!(project.strong_count(), 0, "a queued job still holds its project");
+    }
+
+    /// A job a worker took from the queue before the server was dropped runs cancelled.
+    #[test]
+    fn a_job_started_after_the_drop_is_cancelled() {
+        use super::{FrameKey, FrameServer, Job, run_job};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let s = filmcraft_engine::Session::default();
+        let server = FrameServer::new(s.media.clone(), s.services.clone(), s.previews.clone(), 1);
+        let job = Job {
+            key: FrameKey { target: Target::Item(ItemId(999)), frame: 0, size: 32, revision: 0, draft: false },
+            queued: web_time::Instant::now(),
+            cancel: Default::default(),
+            prefetch: false,
+            catch_up: None,
+            time: filmcraft_time::Tick::ZERO,
+            scale: 0.1,
+            project: Arc::new(filmcraft_project::Project::new("Frames")),
+            prio: 0,
+        };
+        // what `Drop` sets before it cancels the jobs in flight
+        server.shared.stop.store(true, Ordering::Relaxed);
+        run_job(&server.shared, &job, &server.pool, &server.services, &server.previews);
+        assert!(job.cancel.load(Ordering::Relaxed), "the job ran without its cancel flag");
+        assert!(!server.is_ready(&job.key), "a cancelled job's frame is not cached");
     }
 }

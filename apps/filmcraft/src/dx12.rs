@@ -1,13 +1,6 @@
-//! Windows: a DX12 renderer for zero-copy decoding.
-//!
-//! The hardware decoder's pictures are Direct3D 11 textures; the compositor can sample them without
-//! a copy only on a wgpu DX12 device (a Direct3D 12 resource opened from the texture's shared
-//! handle). wgpu's default backend on Windows is Vulkan, and DX12's default shader compiler (FXC)
-//! cannot compile the compositor's effects shader, so this setup is used only when the DirectX
-//! Shader Compiler (`dxcompiler.dll` and `dxil.dll`, next to the executable or in
-//! `FILMCRAFT_DXC_DIR`) is available and the whole compositor builds on it. In every other case
-//! `setup` returns `None` and the app starts exactly as before, decoding with a CPU readback.
-//! `FILMCRAFT_NO_ZERO_COPY=1` keeps the default renderer.
+//! DX12/DXC renderer for shared D3D11 decode textures; Vulkan cannot import these handles.
+//! Requires dxcompiler.dll + dxil.dll beside the executable or in FILMCRAFT_DXC_DIR; FXC cannot compile the compositor shader.
+//! Missing DXC, unsupported compositor or FILMCRAFT_NO_ZERO_COPY=1 -> normal renderer + CPU readback.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,8 +15,7 @@ fn dxc_dir() -> Option<PathBuf> {
     (dir.join("dxcompiler.dll").is_file() && dir.join("dxil.dll").is_file()).then_some(dir)
 }
 
-/// A DX12 instance, adapter and device compiling shaders with DXC, if this machine has them and
-/// the GPU compositor works on them.
+/// DX12/DXC instance, adapter and device after compositor construction succeeds; None retains normal startup.
 pub fn setup() -> Option<WgpuSetupExisting> {
     if std::env::var_os("FILMCRAFT_NO_ZERO_COPY").is_some_and(|v| v != "0") {
         return None;
@@ -50,8 +42,7 @@ pub fn setup() -> Option<WgpuSetupExisting> {
     // P010 (10-bit) pictures are sampled as 16-bit normalised planes
     let features = adapter.features() & wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() })).ok()?;
-    // The compositor must build on this device (its shaders compile with this DXC): otherwise keep
-    // the default renderer.
+    // Probe the complete compositor on this DXC/device before replacing normal startup.
     let failed = Arc::new(AtomicBool::new(false));
     let flag = failed.clone();
     device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
