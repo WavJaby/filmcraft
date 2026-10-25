@@ -232,6 +232,10 @@ pub struct Playback {
     /// The audio clock's last reading and when (egui time, s) it last moved: a device that stops
     /// consuming samples hands the clock back to the wall clock (see [`AUDIO_STALL_S`]).
     audio_seen: (u64, f64),
+    /// When playback lost its output (a failed open or a dead stream), when it is opened again
+    /// (egui time, s; 0 = not retrying). Pause/play proves a fresh stream works, so a stream the
+    /// device keeps dropping is reopened on a timer (see [`AUDIO_RETRY_S`]).
+    audio_retry_at: f64,
     /// Audio underruns for the current (or last) play (desktop: sound is mixed ahead).
     #[cfg(not(target_arch = "wasm32"))]
     pub audio_stats: std::sync::Arc<play_ahead::AudioStats>,
@@ -255,6 +259,11 @@ pub struct Playback {
 /// #136); playback must not freeze on it. Devices that are slow to start (Bluetooth) stay well
 /// under this.
 pub const AUDIO_STALL_S: f64 = 1.0;
+
+/// How often (s) playback re-opens the output after its stream or device failed, while playing
+/// goes on silently on the wall clock. Reopening is what pause/play does by hand; doing it on a
+/// timer brings the sound back when the device recovers (#2503).
+pub const AUDIO_RETRY_S: f64 = 2.0;
 
 /// How long `ui.screenshot` waits for the window to present the frame.
 const SCREENSHOT_TIMEOUT_S: f64 = 10.0;
@@ -514,6 +523,7 @@ impl FilmcraftApp {
         let (view, size) = match ran {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
+                self.disable_gpu(&error);
                 self.frames.reject_plan(key, error);
                 return None;
             }
@@ -774,7 +784,7 @@ impl FilmcraftApp {
             let now = ctx.input(|i| i.time);
             self.playback.anchor_time = now;
             self.playback.audio_seen = (0, now);
-            self.start_audio();
+            self.start_audio(now);
         }
         if let Some(note) = self.audio.as_ref().and_then(|a| a.note()) {
             self.ui.status = note;
@@ -1006,6 +1016,7 @@ impl FilmcraftApp {
             a.stop();
         }
         self.playback.audio_clock = false;
+        self.playback.audio_retry_at = 0.0;
     }
 
     /// Start the clock (and audio) once the first frames are ready or the preroll timed out.
@@ -1014,7 +1025,7 @@ impl FilmcraftApp {
         self.playback.anchor_time = now;
         self.playback.anchor_tick = self.session.playhead();
         self.playback.audio_seen = (0, now);
-        self.start_audio();
+        self.start_audio(now);
         // Audio Track Mixer: an automation pass runs while playing forward in real time
         if (self.playback.speed - 1.0).abs() < 1e-9 && !self.session.mixrec.active() {
             let t = self.session.playhead();
@@ -1066,6 +1077,7 @@ impl FilmcraftApp {
         }
         self.scrub.device_stopped();
         self.playback.audio_clock = false;
+        self.playback.audio_retry_at = 0.0;
         if self.session.mixrec.active() {
             let t = self.session.playhead();
             if let Err(e) = self.session.execute("mixer.recordStop", json!({"time": t.0})) {
@@ -1076,7 +1088,7 @@ impl FilmcraftApp {
         panels::voiceover::on_stop(self);
     }
 
-    fn start_audio(&mut self) {
+    fn start_audio(&mut self, now: f64) {
         let Some(seq_id) = self.session.state.active_sequence else { return };
         let start_tick = self.session.playhead();
         let Some(a) = self.audio.as_mut() else { return };
@@ -1085,6 +1097,7 @@ impl FilmcraftApp {
         // either the original rate conversion or pitch-corrected program audio.
         let Some((mix_rate, mix)) = shuttle::mix(&self.session, seq_id, sr, self.playback.speed) else {
             a.stop();
+            self.playback.audio_retry_at = 0.0;
             return;
         };
         let cursor = start_tick.to_units_floor(i64::from(mix_rate));
@@ -1104,6 +1117,7 @@ impl FilmcraftApp {
         match a.start(fill) {
             Ok(_) => {
                 self.playback.audio_clock = true;
+                self.playback.audio_retry_at = 0.0;
                 if let Some(note) = self.audio.as_ref().and_then(|audio| audio.note()) {
                     self.ui.status = note;
                 }
@@ -1111,6 +1125,7 @@ impl FilmcraftApp {
             Err(e) => {
                 log::warn!("audio output unavailable: {e}");
                 self.playback.audio_clock = false;
+                self.playback.audio_retry_at = now + AUDIO_RETRY_S;
             }
         }
     }
@@ -1133,6 +1148,15 @@ impl FilmcraftApp {
         if self.playback.anchor_time < 0.0 {
             self.playback.anchor_time = now;
         }
+        if !self.playback.audio_clock && self.playback.audio_retry_at > 0.0 && now >= self.playback.audio_retry_at {
+            // The output failed mid-play: open it again where the wall clock got to (what
+            // pause/play does by hand), so a recovering device brings the sound back.
+            self.playback.audio_retry_at = now + AUDIO_RETRY_S;
+            self.playback.anchor_tick = self.session.playhead();
+            self.playback.anchor_time = now;
+            self.playback.audio_seen = (0, now);
+            self.start_audio(now);
+        }
         let rate = self.session.sequence_rate();
         if self.playback.audio_clock
             && let Some(audio) = self.audio.as_mut()
@@ -1146,6 +1170,7 @@ impl FilmcraftApp {
             self.playback.anchor_tick = self.session.playhead();
             self.playback.anchor_time = now;
             self.playback.audio_clock = false;
+            self.playback.audio_retry_at = now + AUDIO_RETRY_S;
             if let Some(audio) = self.audio.as_mut() {
                 audio.stop();
             }
@@ -1204,16 +1229,28 @@ impl FilmcraftApp {
 
     // ---------------------------------------------------------------- textures
 
-    /// Upload a rendered frame into a named texture (only when the key changed).
+    /// Upload a rendered frame into a named texture (only when the key changed), opaque: the
+    /// picture over black.
     pub fn texture_for(&mut self, ctx: &egui::Context, name: &str, key: FrameKey, img: &frames::Rgba) -> egui::TextureId {
+        self.upload_frame(ctx, name, key, img, false)
+    }
+
+    /// Like [`Self::texture_for`], keeping the frame's alpha, so what is painted under the
+    /// texture (the monitors' Transparency Grid) shows through its transparent areas.
+    pub fn texture_with_alpha(&mut self, ctx: &egui::Context, name: &str, key: FrameKey, img: &frames::Rgba) -> egui::TextureId {
+        self.upload_frame(ctx, name, key, img, true)
+    }
+
+    fn upload_frame(&mut self, ctx: &egui::Context, name: &str, key: FrameKey, img: &frames::Rgba, alpha: bool) -> egui::TextureId {
+        let image = || img.color_image(alpha);
         if let Some((k, tex)) = self.textures.get_mut(name) {
             if *k != key {
-                tex.set(egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.px), TextureOptions::LINEAR);
+                tex.set(image(), TextureOptions::LINEAR);
                 *k = key;
             }
             return tex.id();
         }
-        let tex = ctx.load_texture(name, egui::ColorImage::from_rgba_unmultiplied([img.w, img.h], &img.px), TextureOptions::LINEAR);
+        let tex = ctx.load_texture(name, image(), TextureOptions::LINEAR);
         let id = tex.id();
         self.textures.insert(name.to_string(), (key, tex));
         id
@@ -1825,7 +1862,8 @@ impl FilmcraftApp {
         self.handle_drops(&ctx);
         if let Some(rx) = self.command_inbox.take() {
             while let Ok(id) = rx.try_recv() {
-                if self.control_input_only {
+                // control-only mode ignores native menu commands, but Quit stays available (#1943)
+                if self.control_input_only && id != "app.quit" {
                     continue;
                 }
                 if let Err(e) = menus::invoke(self, &ctx, &id, json!({})) {
@@ -2445,6 +2483,71 @@ mod mac_ctrl_click_tests {
 mod gpu_fallback_tests {
     use filmcraft_render::plan::{FramePlan, PlanLayer};
 
+    #[test]
+    fn review_regression_returned_compositor_error_disables_gpu_and_reports_failure() {
+        use super::*;
+        use filmcraft_frame::{Chroma, GpuPixels, GpuSurface, PixelData, VideoFrame};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        const FAILURE: &str = "injected compositor readback failure";
+        #[derive(Debug, Default)]
+        struct LostSurface(AtomicUsize);
+        impl GpuSurface for LostSurface {
+            fn size(&self) -> (u32, u32) {
+                (2, 2)
+            }
+            fn byte_len(&self) -> usize {
+                2 * 2 + 2
+            }
+            fn id(&self) -> u64 {
+                u64::MAX
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn download(&self) -> Result<PixelData, String> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Err(FAILURE.into())
+            }
+        }
+
+        let instance = eframe::wgpu::Instance::new(eframe::wgpu::InstanceDescriptor {
+            backends: eframe::wgpu::Backends::PRIMARY,
+            ..eframe::wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let rs = match pollster::block_on(eframe::egui_wgpu::RenderState::create(&Default::default(), &instance, None, Default::default())) {
+            Ok(rs) => rs,
+            Err(error) => {
+                eprintln!("SKIPPED (returned compositor error): GPU adapter unavailable: {error}");
+                return;
+            }
+        };
+        eprintln!("returned compositor error adapter: {:?}", rs.adapter.get_info());
+        let mut app = FilmcraftApp::new(filmcraft_engine::Session::default());
+        app.set_wgpu(rs);
+        if app.gpu.is_none() {
+            eprintln!("SKIPPED (returned compositor error): unsupported compositor adapter");
+            return;
+        }
+        let surface = Arc::new(LostSurface::default());
+        let frame =
+            Arc::new(VideoFrame { data: PixelData::Gpu(GpuPixels::new(surface.clone(), Chroma::C420, 8)), ..VideoFrame::rgba8(2, 2, vec![0; 2 * 2 * 4]) });
+        let plan = FramePlan::Layers {
+            width: 2,
+            height: 2,
+            layers: vec![PlanLayer::new(frame, filmcraft_geom::Affine::IDENTITY, 1.0, filmcraft_render::Blend::Normal)],
+        };
+        let plan = frames::GpuPlan { prepared: filmcraft_gpu::prepare(&plan), plan };
+        let key = FrameKey { target: frames::Target::SequencePlan(filmcraft_project::ItemId(1)), frame: 0, size: 1000, revision: 0, draft: false };
+        assert!(app.gpu_present(key, &plan).is_none());
+        assert_eq!(surface.0.load(Ordering::Relaxed), 1, "failure probe must execute");
+        assert!(app.frames.take_error().unwrap().contains(FAILURE));
+        assert!(app.gpu.is_none(), "next monitor pass must select CPU compositing");
+    }
+
     /// Software rasterizers must not be treated as a GPU compositor: the preview crawled while
     /// "GPU" usage read 0 % because wgpu had silently fallen back to llvmpipe.
     #[test]
@@ -2485,7 +2588,7 @@ mod audio_recovery_tests {
     use super::*;
     use std::sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     struct Device {
@@ -2730,6 +2833,74 @@ mod audio_recovery_tests {
             shown <= second && shown + app.session.sequence_rate().frame_duration() > second,
             "the playhead follows the frames the device played: {shown:?}"
         );
+        app.stop();
+    }
+
+    /// A device whose stream dies mid-play (`ticking`) or whose open fails (`opens`).
+    struct Reviving {
+        starts: Arc<AtomicUsize>,
+        opens: Arc<AtomicBool>,
+        ticking: Arc<AtomicBool>,
+    }
+
+    impl AudioOut for Reviving {
+        fn start(&mut self, _: Box<dyn FnMut(&mut [f32], usize) + Send>) -> Result<u32, String> {
+            self.starts.fetch_add(1, Ordering::Relaxed);
+            if self.opens.load(Ordering::Relaxed) { Ok(48_000) } else { Err("device unavailable".into()) }
+        }
+        fn stop(&mut self) {}
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn played_frames(&self) -> Option<u64> {
+            self.ticking.load(Ordering::Relaxed).then_some(0)
+        }
+    }
+
+    #[test]
+    fn a_lost_output_is_reopened_and_the_sound_returns() {
+        let mut session = Session::default();
+        session.execute("file.openDemoProject", json!({})).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = FilmcraftApp::new(session);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let ticking = Arc::new(AtomicBool::new(true));
+        app.audio = Some(Box::new(Reviving { starts: starts.clone(), opens: Arc::new(AtomicBool::new(true)), ticking: ticking.clone() }));
+        app.play(1.0);
+        app.end_preroll(0.0);
+        assert!(app.playback.audio_clock && starts.load(Ordering::Relaxed) == 1);
+        // the stream dies: the device stops reporting a playback clock
+        ticking.store(false, Ordering::Relaxed);
+        let mut output = ctx.run_ui(egui::RawInput { time: Some(10.0), ..Default::default() }, |ui| app.advance_playback(ui.ctx()));
+        output.textures_delta.clear();
+        assert!(!app.playback.audio_clock);
+        // the device recovers before the next retry: playback reopens it itself
+        ticking.store(true, Ordering::Relaxed);
+        let mut output = ctx.run_ui(egui::RawInput { time: Some(10.0 + AUDIO_RETRY_S + 0.5), ..Default::default() }, |ui| app.advance_playback(ui.ctx()));
+        output.textures_delta.clear();
+        assert_eq!(starts.load(Ordering::Relaxed), 2, "the output is reopened without pause/play");
+        assert!(app.playback.audio_clock, "the fresh stream is the master clock again");
+        app.stop();
+    }
+
+    #[test]
+    fn a_device_that_appears_mid_playback_starts_sounding() {
+        let mut session = Session::default();
+        session.execute("file.openDemoProject", json!({})).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = FilmcraftApp::new(session);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let opens = Arc::new(AtomicBool::new(false));
+        app.audio = Some(Box::new(Reviving { starts: starts.clone(), opens: opens.clone(), ticking: Arc::new(AtomicBool::new(true)) }));
+        app.play(1.0);
+        app.end_preroll(0.0);
+        assert!(!app.playback.audio_clock, "no device yet: playing on the wall clock");
+        // headphones plug in while playing: the next retry opens them
+        opens.store(true, Ordering::Relaxed);
+        let mut output = ctx.run_ui(egui::RawInput { time: Some(AUDIO_RETRY_S + 0.5), ..Default::default() }, |ui| app.advance_playback(ui.ctx()));
+        output.textures_delta.clear();
+        assert_eq!(starts.load(Ordering::Relaxed), 2, "the output is retried without pause/play");
+        assert!(app.playback.audio_clock);
         app.stop();
     }
 }

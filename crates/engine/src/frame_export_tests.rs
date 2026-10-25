@@ -87,7 +87,7 @@ fn source_frame_export_works_without_an_active_sequence_and_rejects_bad_params()
 }
 
 #[test]
-fn failed_frame_export_preserves_existing_output_and_project() {
+fn review_regression_failed_frame_export_preserves_terminal_error_and_output() {
     use filmcraft_media::{FrameRequest, MediaError, MediaInfo, MediaSource};
     use std::sync::atomic::{AtomicUsize, Ordering};
     struct FailedSource {
@@ -100,6 +100,8 @@ fn failed_frame_export_preserves_existing_output_and_project() {
         }
         fn video_frame(&self, _: FrameRequest) -> filmcraft_media::Result<Arc<filmcraft_frame::VideoFrame>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            // A different clip may already have marked this render pending.
+            filmcraft_media::pending::mark();
             Err(MediaError::Decode("injected frame export failure".into()))
         }
         fn audio(&self, _: i64, _: usize, _: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
@@ -119,6 +121,7 @@ fn failed_frame_export_preserves_existing_output_and_project() {
         let calls = source.calls.load(Ordering::Relaxed);
         let error = s.execute("file.exportFrame", json!({"target":target,"path":path.to_string_lossy(),"import":true})).unwrap_err();
         assert!(error.to_string().contains("injected frame export failure"));
+        assert!(!filmcraft_media::pending::is_set(), "failed exports must consume their pending marker");
         assert!(source.calls.load(Ordering::Relaxed) > calls, "failure probe must execute for {target}");
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert_eq!(s.project.to_json(), before);
@@ -171,7 +174,8 @@ fn a_frame_still_loading_is_reported_not_saved_blank() {
     for target in ["program", "source"] {
         let path = dir.join(format!("{target}.png"));
         let err = s.execute("file.exportFrame", json!({"target":target,"path":path.to_string_lossy()})).unwrap_err();
-        assert!(err.to_string().contains("still loading"), "{target}: {err}");
+        assert_eq!(err.to_string(), "decode error: still decoding", "{target}: preserve the source error");
+        assert!(!filmcraft_media::pending::is_set(), "{target}: consume the pending marker");
         assert!(!path.exists(), "{target}: nothing is written");
     }
     // once the picture is there, the same export succeeds

@@ -69,6 +69,7 @@ fn compositor_conversion_reports_device_loss() {
     let (frame, surface) = frame();
     rejects_pixels(frame.to_linear_f32());
     rejects_pixels(frame.to_linear_f32_decimated(2));
+    rejects_pixels(frame.to_linear_f32_decimated(usize::MAX));
     rejects_pixels(frame.to_linear_f32_region(1, None, filmcraft_frame::Region { x: 0, y: 0, w: 2, h: 2 }));
     rejects_pixels(frame.rotated(1));
     assert_eq!(surface.0.load(Ordering::Relaxed), 1);
