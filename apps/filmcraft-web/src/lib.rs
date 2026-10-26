@@ -206,6 +206,9 @@ pub async fn start(canvas_id: String) -> Result<(), JsValue> {
                     && backend == Some(eframe::wgpu::Backend::BrowserWebGpu)
                     && !query_flag("cpu")
                 {
+                    if query_flag("resident") {
+                        webcodecs::enable_resident();
+                    }
                     app.set_wgpu(rs);
                     set_info("compositor", json!("gpu"));
                 } else {

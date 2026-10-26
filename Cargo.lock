@@ -2497,6 +2497,7 @@ dependencies = [
  "filmcraft-engine",
  "filmcraft-format",
  "filmcraft-frame",
+ "filmcraft-gpu",
  "filmcraft-isobmff",
  "filmcraft-media",
  "filmcraft-time",

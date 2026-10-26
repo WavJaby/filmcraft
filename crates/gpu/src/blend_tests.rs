@@ -13,6 +13,7 @@ use filmcraft_render::plan::execute_cpu;
 pub(crate) fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    eprintln!("GPU blend/effect test adapter: {:?}", adapter.get_info());
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
 }
 

@@ -593,9 +593,12 @@ impl FilmcraftApp {
             return None;
         }
         let t0 = web_time::Instant::now();
+        filmcraft_frame::pending::take();
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.compositor.composite_prepared(&plan.plan, Some(&plan.prepared))));
+        let pending = filmcraft_frame::pending::take();
         let (view, size) = match ran {
             Ok(Ok(output)) => output,
+            Ok(Err(_)) if pending => return None,
             Ok(Err(error)) => {
                 self.disable_gpu(&error);
                 self.frames.reject_plan(key, error);
@@ -3033,6 +3036,7 @@ mod gpu_fallback_tests {
             eprintln!("SKIPPED: no Vulkan adapter");
             return;
         };
+        eprintln!("Preview loss test adapter: {:?}", adapter.get_info());
         let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let renderer = egui_wgpu::Renderer::new(&device, format, Default::default());
@@ -3138,9 +3142,9 @@ mod gpu_fallback_tests {
             fn as_any(&self) -> &dyn std::any::Any {
                 self
             }
-            fn download(&self) -> Result<PixelData, String> {
+            fn prepare_cpu(&self, transfer: filmcraft_frame::CpuTransfer) {
                 self.0.fetch_add(1, Ordering::Relaxed);
-                Err(FAILURE.into())
+                transfer.complete(Err(FAILURE.into()));
             }
         }
 
@@ -3163,8 +3167,8 @@ mod gpu_fallback_tests {
             return;
         }
         let surface = Arc::new(LostSurface::default());
-        let frame =
-            Arc::new(VideoFrame { data: PixelData::Gpu(GpuPixels::new(surface.clone(), Chroma::C420, 8)), ..VideoFrame::rgba8(2, 2, vec![0; 2 * 2 * 4]) });
+        let pixels = GpuPixels::new(surface.clone(), filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 });
+        let frame = Arc::new(VideoFrame { data: PixelData::Gpu(pixels), ..VideoFrame::rgba8(2, 2, vec![0; 2 * 2 * 4]) });
         let plan = FramePlan::Layers {
             width: 2,
             height: 2,

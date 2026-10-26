@@ -1,7 +1,7 @@
 //! The zero-copy picture type of the Windows backend: [`MfSurface`] is a decoded NV12 / P010
 //! picture in a shareable Direct3D 11 texture ([`interop::SharedSurface`]) that implements
 //! [`filmcraft_frame::GpuSurface`]. The GPU compositor opens it on its own DX12 device
-//! ([`import`]); every CPU consumer reads it back through [`MfSurface::download`] (the same staging
+//! ([`import`]); every CPU consumer reads it back through [`MfSurface::prepare_cpu`] (the same staging
 //! copy the readback path uses), once per picture.
 //!
 //! Safe code: the FFI is in `gpu` and `interop`.
@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use filmcraft_frame::{GpuSurface, PixelData};
+use filmcraft_frame::GpuSurface;
 
 use super::gpu::{Gpu, Readback};
 use super::interop::{self, SharedSurface};
@@ -71,12 +71,12 @@ impl GpuSurface for MfSurface {
         (w as usize).saturating_mul(h as usize).saturating_mul(3).saturating_mul(bps) / 2
     }
 
-    fn download(&self) -> Result<PixelData, String> {
+    fn prepare_cpu(&self, transfer: filmcraft_frame::CpuTransfer) {
         // the surface holds the cropped picture, so the geometry's crop is its whole extent
         let (w, h) = self.shared.size();
         let geometry = Geometry { crop: (0, 0, w, h), ..self.geometry };
-        let frame = Readback::default().read_texture(&self.gpu, self.shared.texture(), 0, self.shared.format(), |b| biplanar::to_frame(b, &geometry))?;
-        Ok(frame.data)
+        let frame = Readback::default().read_texture(&self.gpu, self.shared.texture(), 0, self.shared.format(), |b| biplanar::to_frame(b, &geometry));
+        transfer.complete(frame.map(|frame| frame.data));
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -89,8 +89,8 @@ impl GpuSurface for MfSurface {
 }
 
 /// The compositor's way in: open `surface` (which must be an [`MfSurface`]) on `device`.
-fn import(surface: &dyn GpuSurface, device: &wgpu::Device) -> Result<filmcraft_gpu::ImportedPlanes, String> {
+fn import(surface: &dyn GpuSurface, device: &wgpu::Device, _: &wgpu::Queue) -> Result<filmcraft_gpu::ImportedSurface, String> {
     let s = surface.as_any().downcast_ref::<MfSurface>().ok_or("not a Media Foundation surface")?;
     let planes = interop::import(device, &s.shared)?;
-    Ok(filmcraft_gpu::ImportedPlanes { luma: planes.luma, chroma: planes.chroma, keepalive: Box::new(s.shared.clone()) })
+    Ok(filmcraft_gpu::ImportedSurface::Yuv { luma: planes.luma, chroma: planes.chroma, keepalive: Box::new(s.shared.clone()) })
 }

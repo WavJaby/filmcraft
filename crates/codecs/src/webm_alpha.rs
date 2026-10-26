@@ -309,8 +309,8 @@ mod tests {
         fn byte_len(&self) -> usize {
             2 * 2 + 2
         }
-        fn download(&self) -> Result<PixelData, String> {
-            self.0.clone()
+        fn prepare_cpu(&self, transfer: filmcraft_frame::CpuTransfer) {
+            transfer.complete(self.0.clone());
         }
         fn as_any(&self) -> &dyn std::any::Any {
             self
@@ -325,7 +325,10 @@ mod tests {
         let colour = yuv8(2, 2, vec![9; 4]);
         let alpha = yuv8(2, 2, vec![0, 128, 255, 64]);
         let mut frame = colour.clone();
-        frame.data = PixelData::Gpu(filmcraft_frame::GpuPixels::new(Arc::new(AlphaSurface(Ok(colour.data.clone()))), Chroma::C420, 8));
+        frame.data = PixelData::Gpu(filmcraft_frame::GpuPixels::new(
+            Arc::new(AlphaSurface(Ok(colour.data.clone()))),
+            filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 },
+        ));
         set_alpha(&mut frame, &alpha);
         let PixelData::Yuv8 { planes, alpha: actual, .. } = &frame.data else { panic!() };
         let PixelData::Yuv8 { planes: original, .. } = &colour.data else { panic!() };
@@ -334,7 +337,7 @@ mod tests {
         assert_eq!(actual.as_ref(), Some(&alpha_planes[0]));
 
         let surface = Arc::new(AlphaSurface(Err("injected download failure".into())));
-        frame.data = PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface.clone(), Chroma::C420, 8));
+        frame.data = PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface.clone(), filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 }));
         set_alpha(&mut frame, &alpha);
         let PixelData::Gpu(pixels) = &frame.data else { panic!() };
         assert!(Arc::ptr_eq(pixels.surface(), &(surface as Arc<dyn filmcraft_frame::GpuSurface>)));

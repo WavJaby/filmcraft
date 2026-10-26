@@ -3,6 +3,15 @@ use filmcraft_geom::{Affine, Vec2};
 use filmcraft_render::Blend;
 use filmcraft_render::plan::execute_cpu;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn native_surface_owners_remain_send_sync() {
+    fn check<T: Send + Sync>() {}
+    check::<SurfaceKeepalive>();
+    check::<ImportedSurface>();
+    check::<GpuCompositor>();
+}
+
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
@@ -30,14 +39,60 @@ impl filmcraft_frame::GpuSurface for CacheSurface {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    fn download(&self) -> Result<PixelData, String> {
+    fn prepare_cpu(&self, _: filmcraft_frame::CpuTransfer) {
         panic!("cache-only GPU import must not download pixels");
     }
 }
 
-fn import_cache_surface(surface: &dyn filmcraft_frame::GpuSurface, _: &wgpu::Device) -> Result<ImportedPlanes, String> {
+fn import_cache_surface(surface: &dyn filmcraft_frame::GpuSurface, _: &wgpu::Device, _: &wgpu::Queue) -> Result<ImportedSurface, String> {
     let s = surface.as_any().downcast_ref::<CacheSurface>().ok_or("wrong test surface")?;
-    Ok(ImportedPlanes { luma: s.luma.clone(), chroma: s.chroma.clone(), keepalive: Box::new(()) })
+    if s.luma.format() == wgpu::TextureFormat::Rgba8UnormSrgb {
+        return Ok(ImportedSurface::Rgba { texture: s.luma.clone(), keepalive: Box::new(()) });
+    }
+    Ok(ImportedSurface::Yuv { luma: s.luma.clone(), chroma: s.chroma.clone(), keepalive: Box::new(()) })
+}
+
+#[test]
+fn imported_rgba_matches_uploaded_rgba_without_cpu_download() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    set_surface_importer(import_cache_surface);
+    let pixels = vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 255, 255, 255, 255, 0];
+    let texture = dev.create_texture(&wgpu::TextureDescriptor {
+        label: Some("imported-rgba-test"),
+        size: wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    q.write_texture(
+        texture.as_image_copy(),
+        &pixels,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(2 * 4), rows_per_image: Some(2) },
+        texture.size(),
+    );
+    let surface = Arc::new(CacheSurface { id: u64::MAX, luma: texture.clone(), chroma: texture });
+    let cpu = VideoFrame {
+        width: 2,
+        height: 2,
+        data: PixelData::Rgba8(Arc::new(pixels)),
+        color: filmcraft_color::ColorInfo::SRGB_FULL,
+        par: (1, 1),
+        pts: Default::default(),
+    };
+    let gpu = VideoFrame { data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface, filmcraft_frame::GpuFormat::Rgba8)), ..cpu.clone() };
+    let plan = |frame| FramePlan::Layers { width: 5, height: 5, layers: vec![PlanLayer::new(Arc::new(frame), Affine::IDENTITY, 1.0, Blend::Normal)] };
+    let mut compositor = GpuCompositor::new(&dev, &q);
+    compositor.composite(&plan(gpu)).unwrap();
+    let imported = compositor.read_output().unwrap();
+    assert_eq!(compositor.uploaded_bytes, 0);
+    compositor.composite(&plan(cpu)).unwrap();
+    assert_eq!(imported, compositor.read_output().unwrap());
 }
 
 #[test]
@@ -69,7 +124,8 @@ fn cpu_and_gpu_source_ids_do_not_alias() {
         luma: texture(width, height, wgpu::TextureFormat::R8Unorm),
         chroma: texture(width / 2, height / 2, wgpu::TextureFormat::Rg8Unorm),
     });
-    let gpu = VideoFrame { data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface, Chroma::C420, 8)), ..cpu.clone() };
+    let format = filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 };
+    let gpu = VideoFrame { data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface, format)), ..cpu.clone() };
     let mut compositor = GpuCompositor::new(&dev, &queue);
     let cpu_key = compositor.upload(&cpu, None).unwrap();
     let gpu_key = compositor.upload(&gpu, None).unwrap();
@@ -108,7 +164,7 @@ fn imported_sources_obey_cache_budget_and_release_evicted_owners() {
         let f = VideoFrame {
             width: 2,
             height: 2,
-            data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface, Chroma::C420, 8)),
+            data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface, filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 })),
             color: filmcraft_color::ColorInfo::REC709,
             par: (1, 1),
             pts: Default::default(),
@@ -201,7 +257,10 @@ fn imported_yuv_preserves_managed_input_transform() {
         par: (1, 1),
         pts: Default::default(),
     };
-    let gpu_frame = VideoFrame { data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface, Chroma::C420, 8)), ..cpu_frame.clone() };
+    let gpu_frame = VideoFrame {
+        data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface, filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 })),
+        ..cpu_frame.clone()
+    };
     let transform = Arc::new(InputTransform::new(ColorSpace::from_info(&color), color.range, &ColorPipeline::REC709, None));
     assert!(transform.gpu_params().is_some());
     let plan = |frame, input| FramePlan::Layers {
@@ -240,9 +299,9 @@ impl filmcraft_frame::GpuSurface for CpuFallbackSurface {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    fn download(&self) -> Result<PixelData, String> {
+    fn prepare_cpu(&self, transfer: filmcraft_frame::CpuTransfer) {
         self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(PixelData::Yuv8 { planes: [Arc::new(vec![16; 4]), Arc::new(vec![128]), Arc::new(vec![128])], chroma: Chroma::C420, alpha: None })
+        transfer.complete(Ok(PixelData::Yuv8 { planes: [Arc::new(vec![16; 4]), Arc::new(vec![128]), Arc::new(vec![128])], chroma: Chroma::C420, alpha: None }));
     }
 }
 
@@ -263,8 +322,8 @@ fn failed_import_fallback_never_caches_or_uploads_substitute_pixels() {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-        fn download(&self) -> Result<PixelData, String> {
-            Err("injected readback failure".into())
+        fn prepare_cpu(&self, transfer: filmcraft_frame::CpuTransfer) {
+            transfer.complete(Err("injected readback failure".into()));
         }
     }
     let Some((dev, queue)) = device() else {
@@ -272,7 +331,7 @@ fn failed_import_fallback_never_caches_or_uploads_substitute_pixels() {
         return;
     };
     let frame = Arc::new(VideoFrame {
-        data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(Arc::new(Lost), Chroma::C420, 8)),
+        data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(Arc::new(Lost), filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 })),
         ..VideoFrame::rgba8(2, 2, vec![0; 2 * 2 * 4])
     });
     let plan = FramePlan::Layers { width: 2, height: 2, layers: vec![PlanLayer::new(frame.clone(), Affine::IDENTITY, 1.0, Blend::Normal)] };
@@ -311,26 +370,39 @@ fn unsupported_surface_import_downloads_once_and_reuses_cpu_upload() {
         return;
     };
     set_surface_importer(import_cache_surface);
-    let surface = Arc::new(CpuFallbackSurface(std::sync::atomic::AtomicUsize::new(0)));
-    let frame = Arc::new(VideoFrame {
-        width: 2,
-        height: 2,
-        data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface.clone(), Chroma::C420, 8)),
-        color: filmcraft_color::ColorInfo::REC709,
-        par: (1, 1),
-        pts: Default::default(),
+    for format in [filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 }, filmcraft_frame::GpuFormat::Rgba8] {
+        let surface = Arc::new(CpuFallbackSurface(std::sync::atomic::AtomicUsize::new(0)));
+        let frame = Arc::new(VideoFrame {
+            width: 2,
+            height: 2,
+            data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface.clone(), format)),
+            color: filmcraft_color::ColorInfo::REC709,
+            par: (1, 1),
+            pts: Default::default(),
+        });
+        let plan = FramePlan::Layers { width: 2, height: 2, layers: vec![PlanLayer::new(frame, Affine::IDENTITY, 1.0, Blend::Normal)] };
+        let mut c = GpuCompositor::new(&dev, &q);
+        let expected = [0, 0, 0, 255].repeat(2 * 2); // Limited-range Y16/C128 -> opaque black.
+        let expected_bytes = 2 * 2 + 2; // 2x2 luma + one sample per chroma plane, all u8.
+        c.composite(&plan).unwrap();
+        assert_eq!(c.read_output().expect("fallback pixels").2, expected, "{format:?}");
+        assert_eq!(c.uploaded_bytes, expected_bytes);
+        c.composite(&plan).unwrap();
+        assert_eq!(c.read_output().expect("reused fallback pixels").2, expected, "{format:?}");
+        assert_eq!(c.uploaded_bytes, expected_bytes);
+        assert_eq!(surface.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn native_stage_validation_rejects_invalid_shader() {
+    let Some((dev, _)) = device() else { return };
+    assert_eq!(validated_stage(&dev, "valid control", || ()), Some(()));
+    let invalid = validated_stage(&dev, "injected shader failure", || {
+        dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("invalid-stage-test"), source: wgpu::ShaderSource::Wgsl("not WGSL".into()) })
     });
-    let plan = FramePlan::Layers { width: 2, height: 2, layers: vec![PlanLayer::new(frame, Affine::IDENTITY, 1.0, Blend::Normal)] };
-    let mut c = GpuCompositor::new(&dev, &q);
-    let expected = [0, 0, 0, 255].repeat(2 * 2); // Limited-range Y16/C128 -> opaque black.
-    let expected_bytes = 2 * 2 + 2; // 2x2 luma + one sample per chroma plane, all u8.
-    c.composite(&plan).unwrap();
-    assert_eq!(c.read_output().expect("fallback pixels").2, expected);
-    assert_eq!(c.uploaded_bytes, expected_bytes);
-    c.composite(&plan).unwrap();
-    assert_eq!(c.read_output().expect("reused fallback pixels").2, expected);
-    assert_eq!(c.uploaded_bytes, expected_bytes);
-    assert_eq!(surface.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(invalid.is_none(), "validation error must select fallback");
 }
 
 #[test]

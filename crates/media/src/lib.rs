@@ -15,7 +15,7 @@ pub mod cancel;
 pub mod digits;
 pub mod dpx;
 pub mod generators;
-pub mod pending;
+pub use filmcraft_frame::pending;
 pub mod reader;
 pub mod sequence;
 pub mod still;

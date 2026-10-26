@@ -65,9 +65,9 @@ fn failed_gpu_materialization_aborts_render_and_cpu_plan() {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-        fn download(&self) -> std::result::Result<PixelData, String> {
+        fn prepare_cpu(&self, transfer: filmcraft_frame::CpuTransfer) {
             self.0.fetch_add(1, Ordering::Relaxed);
-            Err("injected surface loss".into())
+            transfer.complete(Err("injected surface loss".into()));
         }
     }
     struct Source {
@@ -89,7 +89,10 @@ fn failed_gpu_materialization_aborts_render_and_cpu_plan() {
     place(&mut project, seq, 0, red, 0, 48);
     let surface = Arc::new(Lost(AtomicUsize::new(0)));
     let frame = Arc::new(VideoFrame {
-        data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface.clone(), filmcraft_frame::Chroma::C420, 8)),
+        data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(
+            surface.clone(),
+            filmcraft_frame::GpuFormat::Yuv { chroma: filmcraft_frame::Chroma::C420, bits: 8 },
+        )),
         ..VideoFrame::rgba8(2, 2, vec![0; 2 * 2 * 4])
     });
     let info = sources.0[&red].info().clone();

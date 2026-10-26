@@ -922,8 +922,8 @@ mod tests {
         fn byte_len(&self) -> usize {
             0
         }
-        fn download(&self) -> Result<filmcraft_frame::PixelData, String> {
-            Err("GPU readback failed".into())
+        fn prepare_cpu(&self, transfer: filmcraft_frame::CpuTransfer) {
+            transfer.complete(Err("GPU readback failed".into()));
         }
         fn as_any(&self) -> &dyn std::any::Any {
             self
@@ -941,7 +941,7 @@ mod tests {
         let frame = VideoFrame {
             width,
             height,
-            data: PixelData::Gpu(GpuPixels::new(surface, Chroma::C420, u8::BITS)),
+            data: PixelData::Gpu(GpuPixels::new(surface, filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: u8::BITS })),
             color: filmcraft_color::ColorInfo::REC709,
             par: (1, 1),
             pts: filmcraft_time::Tick::ZERO,
@@ -986,7 +986,7 @@ mod tests {
             d.frame = VideoFrame::rgba8(w, h, [index, 0, 0, 255].repeat((w * h) as usize));
             d.frame.pts = filmcraft_time::Tick(d.pts);
             if d.pts == self.failing_pts && self.unreadable.load(Ordering::Relaxed) {
-                d.frame.data = PixelData::Gpu(GpuPixels::new(surface, Chroma::C420, u8::BITS));
+                d.frame.data = PixelData::Gpu(GpuPixels::new(surface, filmcraft_frame::GpuFormat::Yuv { chroma: Chroma::C420, bits: u8::BITS }));
             }
             d
         }
