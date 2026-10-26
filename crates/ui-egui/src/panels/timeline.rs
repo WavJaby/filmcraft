@@ -847,7 +847,8 @@ fn empty_state(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
     }
     // OS files dropped on an empty Timeline: import already happened; create a sequence from the first item
-    if let Some((items, p)) = app.pending_timeline_drop.clone()
+    if let Some((items, p, viewport)) = app.pending_timeline_drop.clone()
+        && viewport == ui.ctx().viewport_id()
         && rect.contains(p)
         && let Some((first, rest)) = items.split_first()
     {
@@ -3306,7 +3307,8 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
         }
     }
     // ---- OS file drops imported with "drop imports to the timeline": placed at the drop point, one after another
-    if let Some((items, p)) = app.pending_timeline_drop.clone()
+    if let Some((items, p, viewport)) = app.pending_timeline_drop.clone()
+        && viewport == ui.ctx().viewport_id()
         && layout.content.contains(p)
         && app.timeline_drop_target(ui.ctx(), p)
     {
@@ -3327,7 +3329,8 @@ fn interact(app: &mut FilmcraftApp, ui: &mut egui::Ui, seq: &Sequence, layout: &
         }
     }
     // preview of OS files being dragged over the Timeline: a placeholder where the drop would start
-    if let Some((count, p)) = app.file_drag_hover
+    if let Some((count, p, viewport)) = app.file_drag_hover
+        && viewport == ui.ctx().viewport_id()
         && layout.content.contains(p)
         && app.timeline_drop_target(ui.ctx(), p)
     {
