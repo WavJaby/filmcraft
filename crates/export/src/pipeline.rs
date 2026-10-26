@@ -26,18 +26,6 @@ fn bounded_overlay_dimensions(w: usize, h: usize) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod overlay_budget_tests {
-    use super::*;
-
-    #[test]
-    fn overlay_pixel_budget_is_checked_without_overflow() {
-        assert!(bounded_overlay_dimensions(4096, 4096).is_ok());
-        assert!(bounded_overlay_dimensions(4097, 4096).is_err());
-        assert!(bounded_overlay_dimensions(usize::MAX, 2).is_err());
-    }
-}
-
 /// Where the rendered picture lands in the output frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Geometry {
@@ -586,5 +574,17 @@ mod failure_tests {
         sources.0.insert(video, Arc::new(FailedSource(info)));
         let pipeline = Pipeline::new(project, seq, &ExportSettings::default(), false).unwrap();
         assert!(pipeline.frame(0, &sources).unwrap_err().to_string().contains("injected export frame failure"));
+    }
+}
+
+#[cfg(test)]
+mod overlay_budget_tests {
+    use super::*;
+
+    #[test]
+    fn overlay_pixel_budget_is_checked_without_overflow() {
+        assert!(bounded_overlay_dimensions(4096, 4096).is_ok());
+        assert!(bounded_overlay_dimensions(4097, 4096).is_err());
+        assert!(bounded_overlay_dimensions(usize::MAX, 2).is_err());
     }
 }
