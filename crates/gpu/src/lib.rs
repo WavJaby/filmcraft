@@ -52,8 +52,38 @@ pub use mask::GpuMask;
 /// shader applies the sRGB encoding.
 pub const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-/// Existing source-cache bound: stacked layers + playback lookahead.
+/// Source cache budget: stacked layers + playback lookahead, shared by uploads and imports.
 const SOURCE_CACHE_CAPACITY: usize = 24;
+
+/// The two planes of a hardware decoder's picture as textures on the compositor's device: luma
+/// (`R8Unorm` / `R16Unorm`) and interleaved chroma (`Rg8Unorm` / `Rg16Unorm`), plus whatever keeps
+/// their memory alive.
+pub struct ImportedPlanes {
+    pub luma: wgpu::Texture,
+    pub chroma: wgpu::Texture,
+    pub keepalive: Box<dyn std::any::Any + Send + Sync>,
+}
+
+/// Opens a [`GpuSurface`] on a device (zero-copy: the OS decoder's memory, not an upload).
+pub type SurfaceImporter = fn(&dyn filmcraft_frame::GpuSurface, &wgpu::Device) -> Result<ImportedPlanes, String>;
+
+static IMPORTER: std::sync::OnceLock<SurfaceImporter> = std::sync::OnceLock::new();
+
+/// Register how GPU pictures reach the compositor's device (`filmcraft_platform` does it where the
+/// OS decoder can share its surfaces). Without one, GPU pictures are read back and uploaded.
+pub fn set_surface_importer(f: SurfaceImporter) {
+    let _ = IMPORTER.set(f);
+}
+
+// Surface IDs are unique among surfaces, not disjoint from CPU allocation addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum SourceId {
+    Cpu(usize),
+    Gpu(u64),
+}
+
+type SourceKey = (SourceId, u32, u32);
+
 struct Uploaded {
     /// Y, Cb, Cr (or the RGBA texture) and the alpha plane (the dummy texture when there is none).
     views: [wgpu::TextureView; 4],
@@ -63,9 +93,10 @@ struct Uploaded {
     alpha_scale: f32,
     chroma: (u32, u32),
     last_used: u64,
-    /// The uploaded pixel buffers, kept alive while cached: the cache key is the buffer address,
-    /// and a freed buffer's address can be reused by a different frame (stale texture).
+    /// Keep source owners alive; freed CPU addresses may be reused while textures remain cached.
     _pixels: PixelData,
+    /// Keeps imported (zero-copy) planes' memory alive.
+    _keep: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 pub struct GpuCompositor {
@@ -83,7 +114,7 @@ pub struct GpuCompositor {
     backdrop: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
     output: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
     accum_readback_buf: Option<(wgpu::Buffer, u64)>,
-    uploads: HashMap<(usize, u32, u32), Uploaded>,
+    uploads: HashMap<SourceKey, Uploaded>,
     clock: u64,
     dummy: wgpu::TextureView,
     /// The effect stage (None on devices without compute shaders or storage textures: layers
@@ -479,16 +510,13 @@ impl GpuCompositor {
     }
 
     /// Upload (or reuse) the textures of a frame, using `prep` when it was converted beforehand.
-    fn upload(&mut self, f: &VideoFrame, prep: Option<&Prepared>) -> Result<(usize, u32, u32), String> {
-        let prep = if matches!(f.data, PixelData::Gpu(_)) { None } else { prep };
-        let cpu = f.cpu()?;
-        let f = cpu.as_ref();
+    fn upload(&mut self, f: &VideoFrame, prep: Option<&Prepared>) -> Result<SourceKey, String> {
         let id = match &f.data {
-            PixelData::Rgba8(d) => Arc::as_ptr(d) as *const u8 as usize,
-            PixelData::RgbaF32(d) => Arc::as_ptr(d) as *const u8 as usize,
-            PixelData::Yuv8 { planes, .. } => Arc::as_ptr(&planes[0]) as *const u8 as usize,
-            PixelData::Yuv16 { planes, .. } => Arc::as_ptr(&planes[0]) as *const u8 as usize,
-            PixelData::Gpu(_) => return Err("CPU materialization returned a GPU surface".into()),
+            PixelData::Rgba8(d) => SourceId::Cpu(Arc::as_ptr(d) as *const u8 as usize),
+            PixelData::RgbaF32(d) => SourceId::Cpu(Arc::as_ptr(d) as *const u8 as usize),
+            PixelData::Yuv8 { planes, .. } => SourceId::Cpu(Arc::as_ptr(&planes[0]) as *const u8 as usize),
+            PixelData::Yuv16 { planes, .. } => SourceId::Cpu(Arc::as_ptr(&planes[0]) as *const u8 as usize),
+            PixelData::Gpu(g) => SourceId::Gpu(g.surface().id()),
         };
         let key = (id, f.width, f.height);
         self.clock += 1;
@@ -497,6 +525,20 @@ impl GpuCompositor {
             return Ok(key);
         }
         let (w, h) = (f.width, f.height);
+        if let PixelData::Gpu(g) = &f.data {
+            match self.import(g, f) {
+                Ok(up) => {
+                    self.cache_source(key, up);
+                    return Ok(key);
+                }
+                Err(e) => {
+                    // no zero-copy here (not the decoder's adapter, no importer): read it back once
+                    log::warn!("zero-copy import of a decoded picture failed ({e}); uploading it instead");
+                    let cpu = f.cpu()?.into_owned();
+                    return self.upload(&cpu, None);
+                }
+            }
+        }
         let d0 = self.dummy.clone();
         let dummy = || d0.clone();
         let up = match &f.data {
@@ -510,6 +552,7 @@ impl GpuCompositor {
                     chroma: (w, h),
                     last_used: self.clock,
                     _pixels: f.data.clone(),
+                    _keep: None,
                 }
             }
             PixelData::RgbaF32(d) => {
@@ -530,6 +573,7 @@ impl GpuCompositor {
                     chroma: (w, h),
                     last_used: self.clock,
                     _pixels: f.data.clone(),
+                    _keep: None,
                 }
             }
             PixelData::Yuv8 { planes, chroma, alpha } => {
@@ -548,6 +592,7 @@ impl GpuCompositor {
                     chroma: (cw, ch),
                     last_used: self.clock,
                     _pixels: f.data.clone(),
+                    _keep: None,
                 }
             }
             PixelData::Yuv16 { planes, chroma, bits, alpha } => {
@@ -577,23 +622,53 @@ impl GpuCompositor {
                     chroma: (cw, ch),
                     last_used: self.clock,
                     _pixels: f.data.clone(),
+                    _keep: None,
                 }
             }
-            PixelData::Gpu(_) => return Err("CPU materialization returned a GPU surface".into()),
+            // handled above
+            PixelData::Gpu(_) => return Err("GPU surface was not imported".into()),
         };
+        self.cache_source(key, up);
+        Ok(key)
+    }
+
+    fn cache_source(&mut self, key: SourceKey, up: Uploaded) {
         self.uploads.insert(key, up);
         if self.uploads.len() > SOURCE_CACHE_CAPACITY {
-            let mut v: Vec<(u64, (usize, u32, u32))> = self.uploads.iter().map(|(k, u)| (u.last_used, *k)).collect();
+            let mut v: Vec<(u64, SourceKey)> = self.uploads.iter().map(|(k, u)| (u.last_used, *k)).collect();
             v.sort_unstable();
             for (_, k) in v.into_iter().take(self.uploads.len() - SOURCE_CACHE_CAPACITY) {
                 self.uploads.remove(&k);
             }
         }
-        Ok(key)
+    }
+
+    /// Open a decoder's GPU picture as this device's textures (no copy).
+    fn import(&mut self, g: &filmcraft_frame::GpuPixels, f: &VideoFrame) -> Result<Uploaded, String> {
+        let importer = IMPORTER.get().ok_or("no surface importer registered")?;
+        let planes = importer(g.surface().as_ref(), &self.device)?;
+        let (w, h) = (f.width, f.height);
+        let scale = match g.bits {
+            8 => u8::MAX as f32,
+            // P010 stores ten significant bits in the high bits of R16Unorm.
+            10 => u16::MAX as f32 / (1u32 << (u16::BITS - 10)) as f32,
+            _ => return Err(format!("unsupported GPU surface bit depth: {}", g.bits)),
+        };
+        let d0 = self.dummy.clone();
+        Ok(Uploaded {
+            views: [planes.luma.create_view(&Default::default()), planes.chroma.create_view(&Default::default()), d0.clone(), d0],
+            kind: 3,
+            code_scale: scale,
+            alpha_scale: 0.0,
+            chroma: (w.div_ceil(2), h.div_ceil(2)),
+            last_used: self.clock,
+            _pixels: f.data.clone(),
+            _keep: Some(Box::new((planes.luma, planes.chroma, planes.keepalive))),
+        })
     }
 
     /// The source description of an uploaded frame.
-    fn src_info(&self, f: &VideoFrame, key: (usize, u32, u32)) -> Option<SrcInfo> {
+    fn src_info(&self, f: &VideoFrame, key: SourceKey) -> Option<SrcInfo> {
         let up = self.uploads.get(&key)?;
         let code_levels = match &f.data {
             PixelData::Yuv8 { .. } => 256.0,
@@ -617,8 +692,8 @@ impl GpuCompositor {
         let (kr, kb) = src.color.matrix.kr_kb();
         let bits_scale = src.code_levels / 256.0; // 2^(bits - 8), independent of texture encoding
         let (yo, ys, co, cs) = match (src.color.range, src.kind) {
-            (Range::Limited, 2) => (16.0 * bits_scale, 219.0 * bits_scale, 128.0 * bits_scale, 224.0 * bits_scale),
-            (Range::Full, 2) => (0.0, src.code_levels - 1.0, src.code_levels / 2.0, src.code_levels - 1.0),
+            (Range::Limited, 2 | 3) => (16.0 * bits_scale, 219.0 * bits_scale, 128.0 * bits_scale, 224.0 * bits_scale),
+            (Range::Full, 2 | 3) => (0.0, src.code_levels - 1.0, src.code_levels / 2.0, src.code_levels - 1.0),
             _ => (0.0, 1.0, 0.0, 1.0),
         };
         let transfer = match src.color.transfer {
@@ -761,7 +836,7 @@ impl GpuCompositor {
             .collect::<Result<Vec<_>, String>>()?;
         let resolved: Vec<&PlanLayer> = layers.iter().zip(&cpu_fx).map(|(l, c)| c.as_ref().unwrap_or(l)).collect();
         let layers = resolved;
-        let keys: Vec<(usize, u32, u32)> = layers
+        let keys: Vec<SourceKey> = layers
             .iter()
             .enumerate()
             .map(|(i, l)| {
@@ -782,7 +857,7 @@ impl GpuCompositor {
         for (l, k) in layers.iter().zip(&keys) {
             let src = self.src_info(&l.frame, *k).ok_or("GPU source upload missing during composition")?;
             // HDR / wide-gamut Y'CbCr: the planner's input transform, in the shader (#965)
-            let src = SrcInfo { input: l.input.as_ref().filter(|_| src.kind == 2).and_then(|t| t.gpu_params()), ..src };
+            let src = SrcInfo { input: l.input.as_ref().filter(|_| matches!(src.kind, 2 | 3)).and_then(|t| t.gpu_params()), ..src };
             let views = self.uploads.get(k).ok_or("GPU source textures missing during composition")?.views.clone();
             let job = match &l.fx {
                 Some(lfx) => {
@@ -1157,7 +1232,7 @@ fn wait_mapped(device: &wgpu::Device) -> Result<(), String> {
     device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(MAP_TIMEOUT) }).map(|_| ()).map_err(|e| e.to_string())
 }
 
-/// Shader source: kind (0 RGBA8 sRGB, 1 linear premultiplied RGBA, 2 YUV), sampling scales, dimensions, color.
+/// Shader source: kind (0 RGBA8 sRGB, 1 linear premultiplied RGBA, 2 planar YUV, 3 biplanar YUV), scales, dimensions, color.
 struct SrcInfo {
     kind: u32,
     /// Texture sample -> code units; independent of YUV quantization levels.

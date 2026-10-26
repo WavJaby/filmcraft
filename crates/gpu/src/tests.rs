@@ -6,7 +6,121 @@ use filmcraft_render::plan::execute_cpu;
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    eprintln!("GPU test adapter: {:?}", adapter.get_info());
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
+}
+
+#[derive(Debug)]
+struct CacheSurface {
+    id: u64,
+    luma: wgpu::Texture,
+    chroma: wgpu::Texture,
+}
+
+impl filmcraft_frame::GpuSurface for CacheSurface {
+    fn size(&self) -> (u32, u32) {
+        (2, 2)
+    }
+    fn byte_len(&self) -> usize {
+        2 * 2 + 2
+    }
+    fn id(&self) -> u64 {
+        self.id
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn download(&self) -> Result<PixelData, String> {
+        panic!("cache-only GPU import must not download pixels");
+    }
+}
+
+fn import_cache_surface(surface: &dyn filmcraft_frame::GpuSurface, _: &wgpu::Device) -> Result<ImportedPlanes, String> {
+    let s = surface.as_any().downcast_ref::<CacheSurface>().ok_or("wrong test surface")?;
+    Ok(ImportedPlanes { luma: s.luma.clone(), chroma: s.chroma.clone(), keepalive: Box::new(()) })
+}
+
+#[test]
+fn cpu_and_gpu_source_ids_do_not_alias() {
+    let Some((dev, queue)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    set_surface_importer(import_cache_surface);
+    // 2x2: smallest complete NV12 chroma cell, matching CacheSurface::size.
+    let (width, height) = (2, 2);
+    let pixels = Arc::new(vec![0; width as usize * height as usize * 4]);
+    let id = Arc::as_ptr(&pixels) as *const u8 as usize as u64;
+    let texture = |width, height, format| {
+        dev.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cache-identity-test"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    };
+    let cpu = VideoFrame { width, height, data: PixelData::Rgba8(pixels), color: filmcraft_color::ColorInfo::REC709, par: (1, 1), pts: Default::default() };
+    let surface = Arc::new(CacheSurface {
+        id,
+        luma: texture(width, height, wgpu::TextureFormat::R8Unorm),
+        chroma: texture(width / 2, height / 2, wgpu::TextureFormat::Rg8Unorm),
+    });
+    let gpu = VideoFrame { data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface, Chroma::C420, 8)), ..cpu.clone() };
+    let mut compositor = GpuCompositor::new(&dev, &queue);
+    let cpu_key = compositor.upload(&cpu, None).unwrap();
+    let gpu_key = compositor.upload(&gpu, None).unwrap();
+    assert_ne!(cpu_key, gpu_key, "CPU allocations and GPU surfaces have separate identity namespaces");
+    assert_eq!(compositor.upload(&gpu, None).unwrap(), gpu_key);
+    assert_eq!(compositor.uploads[&gpu_key].kind, 3, "the GPU key must retain imported planes");
+    assert_eq!(compositor.uploads[&cpu_key].kind, 0, "the CPU key must retain its RGBA upload");
+}
+
+#[test]
+fn imported_sources_obey_cache_budget_and_release_evicted_owners() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    set_surface_importer(import_cache_surface);
+    let texture = |size, format| {
+        dev.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cache-lifetime-test"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    };
+    let luma = texture(wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 }, wgpu::TextureFormat::R8Unorm);
+    let chroma = texture(wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, wgpu::TextureFormat::Rg8Unorm);
+    let mut c = GpuCompositor::new(&dev, &q);
+    let mut owners = Vec::new();
+    for id in 1..=(SOURCE_CACHE_CAPACITY * 2) {
+        let surface = Arc::new(CacheSurface { id: id as u64, luma: luma.clone(), chroma: chroma.clone() });
+        owners.push(Arc::downgrade(&surface));
+        let f = VideoFrame {
+            width: 2,
+            height: 2,
+            data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface, Chroma::C420, 8)),
+            color: filmcraft_color::ColorInfo::REC709,
+            par: (1, 1),
+            pts: Default::default(),
+        };
+        c.upload(&f, None).unwrap();
+        assert!(c.uploads.len() <= SOURCE_CACHE_CAPACITY);
+    }
+    assert_eq!(owners.iter().filter(|w| w.strong_count() > 0).count(), SOURCE_CACHE_CAPACITY);
+    assert!(owners[..SOURCE_CACHE_CAPACITY].iter().all(|w| w.strong_count() == 0));
+    assert_eq!(c.uploaded_bytes, 0);
+    drop(c);
+    assert!(owners.iter().all(|w| w.strong_count() == 0));
 }
 
 #[test]
@@ -15,7 +129,7 @@ fn yuv_code_range_uniforms() {
     for bits in [8, 10, 12, 16] {
         let levels = (1u32 << bits) as f32;
         for range in [Range::Full, Range::Limited] {
-            let src = SrcInfo {
+            let mut src = SrcInfo {
                 kind: 2,
                 code_scale: if bits == 8 { 255.0 } else { levels },
                 code_levels: levels,
@@ -34,9 +148,80 @@ fn yuv_code_range_uniforms() {
             if u[16..20] != expected {
                 mismatches.push(format!("{bits}-bit {range:?}: {:?} != {expected:?}", &u[16..20]));
             }
+            src.kind = 3;
+            let imported = GpuCompositor::uniforms(&src, &Affine::IDENTITY, 1.0, Blend::Normal, (1, 1));
+            assert_eq!(&imported[16..20], &expected, "biplanar {bits}-bit {range:?}");
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[test]
+fn imported_yuv_preserves_managed_input_transform() {
+    use filmcraft_color::{ColorInfo, ColorPipeline, ColorSpace, InputTransform, Matrix, Primaries, Transfer};
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    set_surface_importer(import_cache_surface);
+    let texture = |width, height, format, bytes: &[u8], bytes_per_row| {
+        let size = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+        let texture = dev.create_texture(&wgpu::TextureDescriptor {
+            label: Some("managed-import-test"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        q.write_texture(
+            texture.as_image_copy(),
+            bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bytes_per_row), rows_per_image: None },
+            size,
+        );
+        texture
+    };
+    // Limited-range luma ramp + non-neutral chroma; 2x2 NV12 matches one planar 4:2:0 cell.
+    let y = vec![64, 144, 200, 235];
+    let uv = [90, 200];
+    let surface = Arc::new(CacheSurface {
+        id: u64::MAX - 2,
+        luma: texture(2, 2, wgpu::TextureFormat::R8Unorm, &y, 2),
+        chroma: texture(1, 1, wgpu::TextureFormat::Rg8Unorm, &uv, 2),
+    });
+    let color = ColorInfo { matrix: Matrix::Bt2020Ncl, transfer: Transfer::Hlg, primaries: Primaries::Bt2020, range: Range::Limited };
+    let cpu_frame = VideoFrame {
+        width: 2,
+        height: 2,
+        data: PixelData::Yuv8 { planes: [Arc::new(y), Arc::new(vec![uv[0]]), Arc::new(vec![uv[1]])], chroma: Chroma::C420, alpha: None },
+        color,
+        par: (1, 1),
+        pts: Default::default(),
+    };
+    let gpu_frame = VideoFrame { data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface, Chroma::C420, 8)), ..cpu_frame.clone() };
+    let transform = Arc::new(InputTransform::new(ColorSpace::from_info(&color), color.range, &ColorPipeline::REC709, None));
+    assert!(transform.gpu_params().is_some());
+    let plan = |frame, input| FramePlan::Layers {
+        width: 2,
+        height: 2,
+        layers: vec![PlanLayer { input, ..PlanLayer::new(Arc::new(frame), Affine::IDENTITY, 1.0, Blend::Normal) }],
+    };
+    let cpu = execute_cpu(&plan(cpu_frame, Some(transform.clone()))).unwrap().over_black_rgba8();
+    let mut compositor = GpuCompositor::new(&dev, &q);
+    compositor.composite(&plan(gpu_frame.clone(), Some(transform))).unwrap();
+    let (_, _, managed) = compositor.read_output().expect("managed readback");
+    compositor.composite(&plan(gpu_frame, None)).unwrap();
+    let (_, _, unmanaged) = compositor.read_output().expect("unmanaged readback");
+    let max_error = |pixels: &[u8]| cpu.iter().zip(pixels).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+    eprintln!("imported HLG: managed error {}, unmanaged error {}", max_error(&managed), max_error(&unmanaged));
+    // Match the existing HDR parity allowance: two 8-bit output codes for GPU rounding.
+    assert!(max_error(&managed) <= 2);
+    // More than twenty codes distinguishes the unmanaged control from the two-code rounding allowance.
+    assert!(max_error(&unmanaged) > 20, "fixture must respond to input color management");
+    assert_eq!(compositor.uploaded_bytes, 0, "resident import uploaded CPU pixels");
 }
 
 #[derive(Debug)]
@@ -62,7 +247,7 @@ impl filmcraft_frame::GpuSurface for CpuFallbackSurface {
 }
 
 #[test]
-fn failed_materialization_never_caches_or_uploads_substitute_pixels() {
+fn failed_import_fallback_never_caches_or_uploads_substitute_pixels() {
     #[derive(Debug)]
     struct Lost;
     impl filmcraft_frame::GpuSurface for Lost {
@@ -120,11 +305,12 @@ fn failed_materialization_never_caches_or_uploads_substitute_pixels() {
 }
 
 #[test]
-fn surface_materialization_downloads_once_and_reuses_cpu_upload() {
+fn unsupported_surface_import_downloads_once_and_reuses_cpu_upload() {
     let Some((dev, q)) = device() else {
         eprintln!("no GPU adapter; skipping");
         return;
     };
+    set_surface_importer(import_cache_surface);
     let surface = Arc::new(CpuFallbackSurface(std::sync::atomic::AtomicUsize::new(0)));
     let frame = Arc::new(VideoFrame {
         width: 2,
