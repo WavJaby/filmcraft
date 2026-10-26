@@ -239,7 +239,7 @@ mod tests {
     /// — the same criterion the golden GPU-vs-CPU parity tests use.
     fn assert_parity(cpu: &Image, gpu: &Image, what: &str) {
         assert_eq!((cpu.w, cpu.h), (gpu.w, gpu.h), "{what}: size mismatch");
-        assert!(cpu.over_black_rgba8().chunks_exact(4).any(|px| px[..3].iter().any(|&v| v != 0)), "{what}: empty reference picture");
+        assert!(cpu.over_black_rgba8().as_chunks::<4>().0.iter().any(|px| px[..3].iter().any(|&v| v != 0)), "{what}: empty reference picture");
         let to8 = |img: &Image| -> Vec<u8> { img.over_black_rgba8() };
         let (a, b) = (to8(cpu), to8(gpu));
         let mut d: Vec<u32> = a
