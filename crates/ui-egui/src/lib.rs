@@ -38,8 +38,8 @@ pub mod control;
 pub mod crash;
 pub mod credits;
 pub mod dock;
-mod dock_shared;
 mod dock_ui;
+pub use dock_ui::area_id as dock_area_id;
 /// Thumbnail textures kept before the least recently used are freed (each is up to 320 px wide).
 const MAX_THUMB_TEXTURES: usize = 512;
 
@@ -67,17 +67,17 @@ pub mod updates_ui;
 pub mod widgets;
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
-use egui::ime_context::{ImeContextTracker, ImeTarget};
+use egui::ime_context::ImeTarget;
 use egui::{TextureHandle, TextureOptions};
 use filmcraft_engine::{Services, Session};
 use filmcraft_time::Tick;
 use serde_json::{Value, json};
 
 pub use control::ControlRequest;
-use dock::PanelKind;
+use dock::{LayoutExt as _, PanelKind};
 use frames::{FrameKey, FrameServer, Target};
 use native_dialogs::FileDialog;
 use state::UiState;
@@ -308,27 +308,28 @@ pub struct FilmcraftApp {
     /// The native file dialog the host is showing ([`Self::pick`]).
     native_dialog: Option<native_dialogs::PendingDialog>,
     pub auto: automation::Registry,
-    /// IME owner/generation/cause state for the custom editors on the Program monitor. State is
-    /// kept per egui viewport; a closed viewport is released in [`eframe::App::on_exit`].
-    pub(crate) ime_context: ImeContextTracker,
     /// Bumped when the custom text edit target is (re)created, a sequence/document context
     /// changes, or a control request replaces `gfxEdit`. It is the replacement epoch of the
     /// otherwise stable sequence/clip/component owner.
     pub(crate) ime_replacement_epoch: u64,
-    /// The (viewport, cumulative pass) whose one IME observation has already been made.
-    ime_observed_pass: Option<(egui::ViewportId, u64)>,
     /// The composition in flight (including an empty preedit awaiting its terminal event), or a
     /// tombstone for a composition whose target was replaced or caret/focus was interrupted.
     pub(crate) ime_composition: Option<ImeComposition>,
     ime_reset: ime_reset::State,
     ime_composition_viewport: Option<egui::ViewportId>,
-    /// The editor drawn in this pass; the final observation runs after control drain.
+    /// The input method at the Program monitor's text caret: event order, the keys it uses, the
+    /// marked text drawn on the video until it commits, and the published IME descriptor.
+    pub(crate) ime_composer: craft_ui::ime::Composer,
+    /// The edit target `ime_composer` was made for; another target gets a new composer, so a
+    /// new IME context.
+    pub(crate) ime_composer_target: Option<ImeTarget>,
+    /// The editor drawn in this pass; the end-of-pass check runs after control drain.
     pub(crate) ime_drawn_editor: Option<panels::graphics::DrawnImeEditor>,
     /// Project document generation last seen by the UI (the engine bumps it on replacement).
     ime_document_epoch: u64,
     /// Active sequence last seen by the UI; `sequence.close` need not emit `OpenSequence`.
     ime_active_sequence: Option<filmcraft_project::ItemId>,
-    /// Viewports this app's custom IME producer has observed, released when the app exits.
+    /// Viewports the Program monitor's editor published in, released when the app exits.
     ime_viewports: Vec<egui::ViewportId>,
     /// Named textures (monitors, thumbnails) with the key they show.
     textures: HashMap<String, (FrameKey, TextureHandle)>,
@@ -384,6 +385,9 @@ pub struct FilmcraftApp {
     /// right button or two-finger click), so the app does the platform's translation itself.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     mac_ctrl_click_armed: bool,
+    /// [`Self::mac_ctrl_click_armed`] for each dock panel's own OS window, shared with the dock
+    /// area's input hook.
+    pub(crate) native_ctrl_click_armed: Arc<Mutex<HashMap<egui::ViewportId, bool>>>,
     /// The mouse press in progress (its start time) and the undo history when it began, for Escape
     /// to take back what the press changed (#580).
     value_press: Option<(f64, filmcraft_engine::UndoMark)>,
@@ -429,10 +433,14 @@ pub struct FilmcraftApp {
     /// The sequence whose view `ui.timeline` holds, and that view as it was last exchanged with
     /// `session.state.timeline_views` (see `sync_timeline_view`).
     timeline_view_of: Option<filmcraft_engine::project::ItemId>,
-    /// Items imported by an OS file drop, to place on the Timeline at the drop point this frame.
-    pending_timeline_drop: Option<(Vec<filmcraft_engine::project::ItemId>, egui::Pos2)>,
-    /// Files being dragged over the window from the OS (count, pointer): the Timeline previews where they would land.
-    file_drag_hover: Option<(usize, egui::Pos2)>,
+    /// Items imported by an OS file drop, to place on the Timeline at the drop point this frame
+    /// (in the coordinates of the viewport the files were dropped on).
+    pending_timeline_drop: Option<(Vec<filmcraft_engine::project::ItemId>, egui::Pos2, egui::ViewportId)>,
+    /// Files being dragged over a window from the OS (count, pointer, viewport): the Timeline previews where they would land.
+    file_drag_hover: Option<(usize, egui::Pos2, egui::ViewportId)>,
+    /// Files dragged over or dropped on dock panels in their own OS windows last frame; the
+    /// dock area reports them after the panels have drawn, so they are imported next frame.
+    window_files: Vec<craft_ui::docking::WindowFiles<PanelKind>>,
     timeline_view_last: Option<filmcraft_engine::project::SequenceView>,
     pub fps: f32,
     last_time: f64,
@@ -654,12 +662,12 @@ impl FilmcraftApp {
             file_dialogs: Default::default(),
             native_dialog: None,
             auto: Default::default(),
-            ime_context: ImeContextTracker::new(),
             ime_replacement_epoch: 0,
-            ime_observed_pass: None,
             ime_composition: None,
             ime_reset: Default::default(),
             ime_composition_viewport: None,
+            ime_composer: craft_ui::ime::Composer::new(),
+            ime_composer_target: None,
             ime_drawn_editor: None,
             ime_document_epoch,
             ime_active_sequence,
@@ -685,6 +693,7 @@ impl FilmcraftApp {
             #[cfg(test)]
             test_now: None,
             mac_ctrl_click_armed: false,
+            native_ctrl_click_armed: Arc::default(),
             value_press: None,
             escape_cancel: false,
             loudness: None,
@@ -707,6 +716,7 @@ impl FilmcraftApp {
             timeline_view_of: None,
             pending_timeline_drop: None,
             file_drag_hover: None,
+            window_files: Vec::new(),
             timeline_view_last: None,
             fps: 60.0,
             last_time: 0.0,
@@ -740,7 +750,7 @@ impl FilmcraftApp {
     ///
     /// The owner key names the sequence, clip and component. A recreated edit session on the
     /// same key (or a document/sequence replacement) must not inherit the previous IME context,
-    /// so the app advances this epoch and the tracker resets the generation once.
+    /// so the app advances this epoch and the editor's next pass starts a new composer.
     pub(crate) fn restart_ime_target(&mut self) {
         self.ime_replacement_epoch = self.ime_replacement_epoch.wrapping_add(1);
         self.invalidate_ime_composition();
@@ -845,6 +855,31 @@ impl FilmcraftApp {
         self.ime_reset.finish(ctx, destination, self.ime_reset.owns_output(ctx));
     }
 
+    /// [`Self::ui`]'s end-of-pass IME check for a native floating window, after its last panel
+    /// body: the Program monitor's editor, when it was drawn there, keeps or drops the
+    /// composer's descriptor, and the window's reset fence suspends or rearms.
+    pub(crate) fn finish_ime_window(&mut self, ctx: &egui::Context) {
+        let viewport = ctx.viewport_id();
+        if self.ime_drawn_editor.as_ref().is_none_or(|drawn| drawn.viewport != viewport) {
+            self.ime_reset.suspend(viewport);
+            return;
+        }
+        self.ime_reset.viewport = viewport;
+        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(input.focused));
+        let eligible = panels::graphics::finish_graphics_ime(self, ctx, false) && focused;
+        let destination = panels::graphics::current_reset_destination(self);
+        if !eligible {
+            self.suspend_ime_input(ctx);
+            self.ime_reset.finish_window(ctx, None, None);
+            return;
+        }
+        if let Some(destination) = destination {
+            self.sync_live_ime_destination(ctx, destination);
+        }
+        let output = self.ime_composer_target.and_then(|target| ime_reset::published(ctx, target.owner));
+        self.ime_reset.finish_window(ctx, destination, output);
+    }
+
     /// Notice a document replacement or an active-sequence change that did not emit
     /// `OpenSequence` (`file.newProject`, a project with no sequence, `sequence.close`). The
     /// edit target and any in-flight composition belong to the old context.
@@ -865,33 +900,17 @@ impl FilmcraftApp {
         ctx.data_mut(|data| data.remove::<PanelKind>(text_edit.with("panel")));
     }
 
-    /// Mark this viewport/pass as observed by the custom producer, so the end-of-pass fallback
-    /// does not observe it a second time.
-    pub(crate) fn note_ime_observed(&mut self, viewport: egui::ViewportId, pass_nr: u64) {
-        self.ime_observed_pass = Some((viewport, pass_nr));
+    /// Remember a viewport the Program monitor's editor published in, for [`eframe::App::on_exit`].
+    pub(crate) fn note_ime_viewport(&mut self, viewport: egui::ViewportId) {
         if !self.ime_viewports.contains(&viewport) {
             self.ime_viewports.push(viewport);
         }
     }
 
-    /// Observe `None` once for a pass where no visible, focused custom IME owner drew a
-    /// descriptor. This is the explicit hidden/unfocused signal the tracker needs; a gap alone
-    /// is a fallback, not a replacement for it.
+    /// The main window's end-of-pass check of the Program monitor's editor, after the pass's
+    /// control requests ran. Native floating windows ran theirs in [`Self::finish_ime_window`].
     pub(crate) fn finish_ime_pass(&mut self, ctx: &egui::Context) {
-        let viewport = ctx.viewport_id();
-        let pass_nr = ctx.cumulative_pass_nr_for(viewport);
-        // The Program monitor deferred its observation until all control requests for this pass
-        // have run. It reports `true` even when it observed an explicit `None` for a hidden or
-        // replaced editor.
-        if panels::graphics::finish_graphics_ime(self, ctx) {
-            return;
-        }
-        if self.ime_observed_pass == Some((viewport, pass_nr)) {
-            return;
-        }
-        // Availability retirement belongs to the unconditional outer reset finalizer.
-        self.ime_context.observe(viewport, None);
-        self.note_ime_observed(viewport, pass_nr);
+        let _ = panels::graphics::finish_graphics_ime(self, ctx, true);
     }
 
     /// Isolate an automation-owned app from native keyboard, pointer, drop and menu input.
@@ -1152,9 +1171,7 @@ impl FilmcraftApp {
 
     pub fn set_workspace(&mut self, name: &str) {
         self.ui.workspace = name.to_string();
-        let layout = dock::saved_docking(&self.workspaces, name);
-        self.ui.dock = layout.root;
-        self.ui.floating = layout.floating;
+        self.ui.dock = dock::saved_docking(&self.workspaces, name);
         self.pending_panel_raise = None;
         self.ui.keys.maximized = None;
         if self.workspaces.current != name {
@@ -1172,20 +1189,20 @@ impl FilmcraftApp {
     pub fn show_panel(&mut self, p: PanelKind) {
         // closed while floating: it floats again where it was (#1985); taken before the Timeline's
         // own restore below docks it
-        let open = self.ui.dock.contains(p) || self.ui.floating.iter().any(|group| group.panels.contains(&p));
+        let open = self.ui.dock.contains(&p);
         let refloat = match self.ui.closed_floating.iter().position(|(k, _)| *k == p) {
             Some(i) if !open => Some(self.ui.closed_floating.remove(i).1),
             _ => None,
         };
-        if p == PanelKind::Timeline && !self.ui.floating.iter().any(|group| group.panels.contains(&p)) {
+        if p == PanelKind::Timeline {
             self.ui.dock.restore_timeline();
         }
-        if !self.ui.dock.contains(p) && !self.ui.floating.iter().any(|group| group.panels.contains(&p)) {
+        if !self.ui.dock.contains(&p) {
             let near = match p {
                 // a side panel beside Properties (or Essential Sound), never over the Program monitor
                 PanelKind::TextToSpeech => [PanelKind::Properties, PanelKind::EssentialSound, PanelKind::EssentialGraphics]
                     .into_iter()
-                    .find(|k| self.ui.dock.contains(*k))
+                    .find(|k| self.ui.dock.contains(k))
                     .unwrap_or(PanelKind::Program),
                 PanelKind::LumetriColor | PanelKind::EssentialGraphics | PanelKind::EssentialSound | PanelKind::Properties => PanelKind::Program,
                 PanelKind::Source
@@ -1773,63 +1790,87 @@ impl FilmcraftApp {
         })
     }
 
-    /// Import dropped files. With Timeline ▸ drop imports to the timeline, the new items are also
-    /// queued to be placed at the pointer (see `timeline::interact`).
+    /// Import dropped files, on the main window and on dock panels in their own OS windows.
+    /// With Timeline ▸ drop imports to the timeline, the new items are also queued to be placed
+    /// at the pointer (see `timeline::interact`).
     fn handle_drops(&mut self, ctx: &egui::Context) {
+        let to_timeline = self.session.prefs.timeline.drop_import_to_timeline;
         // While files hover, the OS sends no cursor events: poll the cursor each frame to draw the Timeline preview.
         let hovering = ctx.input(|i| i.raw.hovered_files.len());
-        self.file_drag_hover = if hovering > 0 && self.session.prefs.timeline.drop_import_to_timeline {
+        self.file_drag_hover = None;
+        if hovering > 0 && to_timeline {
             ctx.request_repaint();
-            self.drop_pointer(ctx).map(|p| (hovering, p))
-        } else {
-            None
-        };
-        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        let mut paths = Vec::new();
-        for f in dropped {
-            let p = f.path();
-            if p.exists() {
-                paths.push(p.to_string_lossy().to_string());
-            }
+            self.file_drag_hover = self.drop_pointer(ctx, egui::ViewportId::ROOT, None).map(|p| (hovering, p, egui::ViewportId::ROOT));
         }
-        if !paths.is_empty() {
-            let pointer = self.drop_pointer(ctx);
-            let imported = self.session.execute("file.import", json!({"paths": paths, "bin": self.import_bin().0}));
-            if let Ok(v) = imported
-                && let Some(pos) = pointer
-                && self.session.prefs.timeline.drop_import_to_timeline
-            {
-                let items: Vec<filmcraft_engine::project::ItemId> =
-                    v["items"].as_array().map(|a| a.iter().filter_map(|i| i.as_u64()).map(filmcraft_engine::project::ItemId).collect()).unwrap_or_default();
-                if !items.is_empty() {
-                    self.pending_timeline_drop = Some((items, pos));
-                }
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if !dropped.is_empty() {
+            let pointer = self.drop_pointer(ctx, egui::ViewportId::ROOT, None);
+            self.import_dropped(&dropped, pointer.map(|p| (p, egui::ViewportId::ROOT)));
+        }
+        for files in std::mem::take(&mut self.window_files) {
+            // Only the Timeline places files at the pointer; elsewhere they go to the bin.
+            let at_timeline = to_timeline && files.panel == PanelKind::Timeline;
+            let pointer = if at_timeline { self.drop_pointer(ctx, files.viewport, files.pos) } else { None };
+            if !files.hovered.is_empty() && self.file_drag_hover.is_none() && at_timeline {
+                ctx.request_repaint();
+                self.file_drag_hover = pointer.map(|p| (files.hovered.len(), p, files.viewport));
+            }
+            if !files.dropped.is_empty() {
+                self.import_dropped(&files.dropped, pointer.map(|p| (p, files.viewport)));
             }
         }
     }
 
-    /// Where files dragged in from the OS are over the window. The OS reports no cursor motion during such a drag
-    /// (winit, Windows), so ask it through the host hook, else use the last pointer position egui saw.
-    fn drop_pointer(&self, ctx: &egui::Context) -> Option<egui::Pos2> {
+    /// Import the dropped files that exist; with a pointer and Timeline ▸ drop imports to the
+    /// timeline, queue the new items for the Timeline drawn in that viewport.
+    fn import_dropped(&mut self, dropped: &[egui::DroppedFileHandle], pointer: Option<(egui::Pos2, egui::ViewportId)>) {
+        let paths: Vec<String> = dropped.iter().map(|f| f.path()).filter(|p| p.exists()).map(|p| p.to_string_lossy().to_string()).collect();
+        if paths.is_empty() {
+            return;
+        }
+        let imported = self.session.execute("file.import", json!({"paths": paths, "bin": self.import_bin().0}));
+        if let Ok(v) = imported
+            && let Some((pos, viewport)) = pointer
+            && self.session.prefs.timeline.drop_import_to_timeline
+        {
+            let items: Vec<filmcraft_engine::project::ItemId> =
+                v["items"].as_array().map(|a| a.iter().filter_map(|i| i.as_u64()).map(filmcraft_engine::project::ItemId).collect()).unwrap_or_default();
+            if !items.is_empty() {
+                self.pending_timeline_drop = Some((items, pos, viewport));
+            }
+        }
+    }
+
+    /// Where files dragged in from the OS are over `viewport`. The OS reports no cursor motion during such a drag
+    /// (winit, Windows), so ask it through the host hook, else use `last` (a native window's last
+    /// pointer position), else the last pointer position egui saw in the main window.
+    fn drop_pointer(&self, ctx: &egui::Context, viewport: egui::ViewportId, last: Option<egui::Pos2>) -> Option<egui::Pos2> {
         let os_pointer = self
             .hooks
             .cursor_screen_position
             .as_ref()
             .and_then(|f| f())
-            .and_then(|px| ctx.input(|i| i.viewport().inner_rect.map(|r| screen_px_to_ui(px, i.pixels_per_point, r.min))));
-        os_pointer.or_else(|| ctx.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos())))
+            .and_then(|px| ctx.input_for(viewport, |i| i.viewport().inner_rect.map(|r| screen_px_to_ui(px, i.pixels_per_point, r.min))));
+        let fallback = || if viewport == egui::ViewportId::ROOT { ctx.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos())) } else { None };
+        os_pointer.or(last).or_else(fallback)
     }
 
     // ---------------------------------------------------------------- input
 
     /// Sends the menu tree to the native menu bar when it changed, so its items show the same
     /// labels, shortcuts and enablement as the in-window menus (Undo with nothing to undo is
-    /// disabled). Without a native menu bar this does nothing.
-    fn sync_native_menu(&mut self) {
+    /// disabled). The items a focused text field takes stay enabled while one has the keyboard.
+    /// Without a native menu bar this does nothing.
+    fn sync_native_menu(&mut self, ctx: &egui::Context) {
         if self.hooks.menu_changed.is_none() {
             return;
         }
-        let items = menus::menu_items(self);
+        let mut items = menus::menu_items(self);
+        if menus::text_field_window(ctx).is_some() {
+            for it in items.iter_mut().filter(|it| menus::edits_text(&it.id)) {
+                it.enabled = true;
+            }
+        }
         if items == self.menu_sent {
             return;
         }
@@ -1839,13 +1880,14 @@ impl FilmcraftApp {
         self.menu_sent = items;
     }
 
-    /// Whether keyboard focus is on a dock divider or a floating panel's resize grip, as drawn last pass.
+    /// Whether keyboard focus is on any dock divider or floating-window resize grip, as drawn last pass.
     fn divider_focused(&self, ctx: &egui::Context) -> bool {
+        use craft_ui::docking::{DockArea, Hit};
         let Some(focused) = ctx.memory(|m| m.focused()) else { return false };
-        self.auto
-            .all()
+        let area = dock_ui::area_id();
+        DockArea::<PanelKind>::hit_rects(ctx, area)
             .iter()
-            .any(|e| e.response_id == Some(focused) && (e.id.starts_with("dock.gutter.") || (e.id.starts_with("panel.float.") && e.id.ends_with(".resize"))))
+            .any(|(hit, _)| matches!(hit, Hit::Divider(_) | Hit::Resize(..)) && DockArea::hit_id(area, hit) == focused)
     }
 
     /// Per-pass shortcut handling: reset the pasted image, rebuild bindings only when the shortcut revision or workspace set changes, and leave unmodified keys
@@ -1859,8 +1901,8 @@ impl FilmcraftApp {
             self.bindings = menus::bindings(self);
             self.bindings_rev = self.session.shortcuts.revision;
         }
-        // A pane divider or floating-panel grip keeps focus after a pointer drag so arrows can
-        // nudge it, but it takes no other key: Space and the other shortcuts keep working (#1482).
+        // A focused dock divider or floating-window grip takes the arrow keys to nudge it, but no
+        // other key: Space and the other shortcuts keep working (#1482).
         let divider_focused = self.divider_focused(ctx);
         if (ctx.egui_wants_keyboard_input() && !divider_focused) || self.dialog == Some(Dialog::Shortcuts) {
             return;
@@ -1876,68 +1918,108 @@ impl FilmcraftApp {
             let _ = self.session.execute("trim.cancelDynamic", json!({}));
         }
         panels::masks::pen_take_back(self, ctx, text_focused);
+        let fire = ctx.input_mut(|i| self.match_shortcuts(i, text_focused, divider_focused));
+        self.fire_shortcuts(ctx, fire);
+    }
+
+    /// Key, text and clipboard events that a floating panel in its own OS window left over
+    /// (`DockOutput::forwarded_events`): they run the main window's bindings in the frame they
+    /// arrive, so shortcuts work while a floating window has focus. craft-ui forwards nothing
+    /// while that window's text field has focus.
+    pub(crate) fn handle_forwarded_keys(&mut self, ctx: &egui::Context, events: Vec<egui::Event>) {
+        if events.is_empty() || self.dialog == Some(Dialog::Shortcuts) {
+            return;
+        }
+        let mut input = egui::InputState::default();
+        input.modifiers = self.floating_window_modifiers(ctx);
+        input.events = events;
+        if self.session.trim_play.dynamic.is_some() && input.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+            let _ = self.session.execute("trim.cancelDynamic", json!({}));
+        }
+        let fire = self.match_shortcuts(&mut input, false, false);
+        self.fire_shortcuts(ctx, fire);
+    }
+
+    /// The modifiers held in the focused native floating window. Copy, Cut and Paste events
+    /// carry none, and egui-winit drops the key press they stand for.
+    fn floating_window_modifiers(&self, ctx: &egui::Context) -> egui::Modifiers {
+        self.ui
+            .dock
+            .floating
+            .iter()
+            .filter(|window| window.native.is_some())
+            .map(|window| craft_ui::docking::DockArea::<PanelKind>::window_viewport(dock_ui::area_id(), window.id))
+            .find_map(|viewport| ctx.input_for(viewport, |i| (i.viewport().focused == Some(true)).then_some(i.modifiers)))
+            .unwrap_or_default()
+    }
+
+    /// The binding ids the key presses in `i` fire, consuming those presses.
+    fn match_shortcuts(&mut self, i: &mut egui::InputState, text_focused: bool, divider_focused: bool) -> Vec<String> {
         // Panel shortcuts of the focused panel override application shortcuts on the same chord.
         // egui ignores extra Shift and Alt when matching, so the most specific chords go first
         // across both scopes (the sort is stable, so the panel still wins a tie): otherwise the
         // Timeline's `Delete` (Clear) swallows the app-wide `Shift+Delete` (Ripple Delete) (#680).
         let focused = self.ui.focused.title();
         let mut fire = Vec::new();
-        ctx.input_mut(|i| {
-            let modifiers = i.modifiers;
-            // With no text on the system clipboard, egui-winit drops the Ctrl+V press but still
-            // passes its release: put the press back, so Paste can paste files or an image (#611).
-            let mut swallowed = None;
-            for e in &i.events {
-                match e {
-                    egui::Event::Key { key: egui::Key::V, pressed, modifiers: m, .. } => {
-                        if !pressed && !self.v_down {
-                            swallowed = Some(*m);
-                        }
-                        self.v_down = *pressed;
+        let modifiers = i.modifiers;
+        // With no text on the system clipboard, egui-winit drops the Ctrl+V press but still
+        // passes its release: put the press back, so Paste can paste files or an image (#611).
+        let mut swallowed = None;
+        for e in &i.events {
+            match e {
+                egui::Event::Key { key: egui::Key::V, pressed, modifiers: m, .. } => {
+                    if !pressed && !self.v_down {
+                        swallowed = Some(*m);
                     }
-                    egui::Event::PasteImage(image) => {
-                        // Keep the delivered pixels; re-reading the OS clipboard later is racy and
-                        // the web host has no clipboard-media hook at all.
-                        self.pasted_image = Some(image.clone());
-                        if modifiers.command {
-                            self.v_down = true;
-                        }
+                    self.v_down = *pressed;
+                }
+                egui::Event::PasteImage(image) => {
+                    // Keep the delivered pixels; re-reading the OS clipboard later is racy and
+                    // the web host has no clipboard-media hook at all.
+                    self.pasted_image = Some(image.clone());
+                    if modifiers.command {
+                        self.v_down = true;
                     }
-                    egui::Event::Paste(_) if modifiers.command => self.v_down = true,
-                    _ => {}
                 }
+                egui::Event::Paste(_) if modifiers.command => self.v_down = true,
+                _ => {}
             }
-            if let Some(m) = swallowed {
-                i.events.push(egui::Event::Key {
-                    key: egui::Key::V,
-                    physical_key: Some(egui::Key::V),
-                    pressed: true,
-                    repeat: false,
-                    modifiers: m | egui::Modifiers::COMMAND,
-                });
+        }
+        if let Some(m) = swallowed {
+            i.events.push(egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: Some(egui::Key::V),
+                pressed: true,
+                repeat: false,
+                modifiers: m | egui::Modifiers::COMMAND,
+            });
+        }
+        clipboard_events_as_keys(&mut i.events, modifiers);
+        let panel = self.bindings.iter().filter(|b| b.3.as_deref() == Some(focused));
+        let app_wide = self.bindings.iter().filter(|b| b.3.is_none());
+        let mut candidates: Vec<&menus::KeyBinding> = panel.chain(app_wide).collect();
+        candidates.sort_by_key(|b| std::cmp::Reverse(menus::specificity(b.0)));
+        for (m, k, id, _) in candidates {
+            // With a text field focused, an unmodified key belongs to the field (and to the input
+            // method composing in it), not to a tool shortcut: `J`, `Z`, `R`, `A`… are the keys
+            // Vietnamese Telex combines into diacritics (#243). Chords with a modifier stay:
+            // Ctrl+S and friends are not something a text field or an IME consumes.
+            if lets_text_field_keep(*m, text_focused) {
+                continue;
             }
-            clipboard_events_as_keys(&mut i.events, modifiers);
-            let panel = self.bindings.iter().filter(|b| b.3.as_deref() == Some(focused));
-            let app_wide = self.bindings.iter().filter(|b| b.3.is_none());
-            let mut candidates: Vec<&menus::KeyBinding> = panel.chain(app_wide).collect();
-            candidates.sort_by_key(|b| std::cmp::Reverse(menus::specificity(b.0)));
-            for (m, k, id, _) in candidates {
-                // With a text field focused, an unmodified key belongs to the field (and to the input
-                // method composing in it), not to a tool shortcut: `J`, `Z`, `R`, `A`… are the keys
-                // Vietnamese Telex combines into diacritics (#243). Chords with a modifier stay:
-                // Ctrl+S and friends are not something a text field or an IME consumes.
-                if lets_text_field_keep(*m, text_focused) {
-                    continue;
-                }
-                // The focused divider consumes the arrows itself (egui matches them with any Shift/Alt).
-                if divider_focused && matches!(k, egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown) {
-                    continue;
-                }
-                if i.consume_key(*m, *k) {
-                    fire.push(id.clone());
-                }
+            // The focused divider consumes the arrows itself (egui matches them with any Shift/Alt).
+            if divider_focused && matches!(k, egui::Key::ArrowLeft | egui::Key::ArrowRight | egui::Key::ArrowUp | egui::Key::ArrowDown) {
+                continue;
             }
-        });
+            if i.consume_key(*m, *k) {
+                fire.push(id.clone());
+            }
+        }
+        fire
+    }
+
+    /// Run the commands of the bindings `match_shortcuts` fired, as the focused panel scopes them.
+    fn fire_shortcuts(&mut self, ctx: &egui::Context, fire: Vec<String>) {
         for mut id in fire {
             // Select All / Deselect All act on the Project panel's items when it has focus (#168).
             // Select All takes only what the shown bin lists, not the whole project (#456).
@@ -2132,7 +2214,7 @@ impl FilmcraftApp {
         let t = self.tokens;
         let full = ui.max_rect();
         ui.painter().rect_filled(full, 0.0, t.app_bg);
-        let header_h = if self.ui.show_header { 38.0 } else { 0.0 };
+        let header_h = if self.ui.show_header { header::HEIGHT } else { 0.0 };
         let header = egui::Rect::from_min_size(full.min, egui::vec2(full.width(), header_h));
         if self.ui.show_header {
             header::show(self, ui, header);
@@ -2335,6 +2417,31 @@ impl FilmcraftApp {
     }
 }
 
+/// `--control-input-only`: drop the window system's input. Screenshot results arrive through
+/// `ScreenshotCallback`, not raw input; all viewport lifecycle and geometry data stay.
+fn drop_native_input(raw_input: &mut egui::RawInput) {
+    raw_input.events.clear();
+    raw_input.hovered_files.clear();
+    raw_input.dropped_files.clear();
+}
+
+/// The main window's input rewrite ([`eframe::App::raw_input_hook`]) for a dock panel in its
+/// own OS window, which eframe does not run the hook for: macOS Control+Click becomes a
+/// secondary click, and `--control-input-only` drops the window system's input. Control
+/// gestures go to the main window only, so nothing is added.
+pub(crate) fn rewrite_native_window_input(
+    control_input_only: bool,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] armed: &Mutex<HashMap<egui::ViewportId, bool>>,
+    raw_input: &mut egui::RawInput,
+) {
+    if control_input_only {
+        drop_native_input(raw_input);
+    } else {
+        #[cfg(target_os = "macos")]
+        synthesize_mac_ctrl_click(armed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(raw_input.viewport_id).or_default(), raw_input);
+    }
+}
+
 /// On macOS a Control+Click means "right click": AppKit delivers it to the view as a *primary*
 /// press carrying the Control modifier (`rightMouseDown:` only fires for a real right button or
 /// two-finger click), so the app translates it to a secondary click before egui computes pointer
@@ -2466,9 +2573,7 @@ impl FilmcraftApp {
                     self.restart_ime_target();
                     // show the sequence with its own view (or fitted, the first time)
                     self.timeline_view_of = None;
-                    if !self.ui.floating.iter().any(|group| group.panels.contains(&PanelKind::Timeline)) {
-                        self.ui.dock.restore_timeline();
-                    }
+                    self.ui.dock.restore_timeline();
                     let _ = self.apply_dock(craft_ui::docking::Action::Activate { panel: PanelKind::Timeline });
                 }
                 filmcraft_engine::Event::OpenSource(_) => {
@@ -2489,7 +2594,7 @@ impl FilmcraftApp {
                 if self.control_input_only && id != "app.quit" {
                     continue;
                 }
-                if let Err(e) = menus::invoke(self, ctx, &id, json!({})) {
+                if let Err(e) = menus::activate_native(self, ctx, &id) {
                     self.ui.status = e;
                 }
             }
@@ -2520,7 +2625,7 @@ impl FilmcraftApp {
     }
 
     /// Draw one real UI pass. Establish the UI clock offset once, run first-pass input handling,
-    /// draw panels under a panic guard, drain UI requests and observe the IME editor only after
+    /// draw panels under a panic guard, drain UI requests and check the IME editor only after
     /// this pass's commands ran. Screenshots are offered to `capture::issue`, which issues only
     /// on an accepted pass.
     fn ui_inner(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -2569,7 +2674,7 @@ impl FilmcraftApp {
             self.begin_press(&ctx);
             self.latch_escape_cancel(&ctx);
             self.handle_shortcuts(&ctx);
-            self.sync_native_menu();
+            self.sync_native_menu(&ctx);
             self.scrub_audio(&ctx);
         } else {
             // Pass 1+ redraws the same frame; drop the discarded pass's registrations so lookups
@@ -2600,9 +2705,9 @@ impl FilmcraftApp {
         if !ctx.will_discard() {
             self.drain_ui_requests(&ctx);
         }
-        // Observe only after this pass's control requests ran: `ui.menu.invoke`/`engine.execute`
+        // Check only after this pass's control requests ran: `ui.menu.invoke`/`engine.execute`
         // may have edited the text or replaced the target. Every other pass (hidden editor, focus
-        // in another panel, no editor at all) reports an explicit `None`.
+        // in another panel, no editor at all) turns the composer off.
         self.finish_ime_pass(&ctx);
         // Ack `ui.*` waiters once the action had a final, non-discarded UI pass to apply in. Holding
         // them through a discard avoids reporting success for a pass egui threw away.
@@ -2629,11 +2734,7 @@ impl eframe::App for FilmcraftApp {
             synthesize_mac_ctrl_click(&mut self.mac_ctrl_click_armed, raw_input);
         }
         if self.control_input_only {
-            // Screenshot results arrive through `ScreenshotCallback`, not raw input. Preserve all
-            // viewport lifecycle/geometry metadata and drop native input only.
-            raw_input.events.clear();
-            raw_input.hovered_files.clear();
-            raw_input.dropped_files.clear();
+            drop_native_input(raw_input);
         }
         if self.control_input_only || !self.synthetic.is_empty() || self.synthetic_pending_step.is_some() {
             // Native modifiers cannot replace those requested by a control gesture. A queued
@@ -2687,16 +2788,14 @@ impl eframe::App for FilmcraftApp {
         self.finish_ime_reset_logic(ctx);
     }
 
-    /// Cancel outstanding screenshots with one error reply each, end per-viewport IME tracker and
-    /// reset state, and shut the session down so its recovery journal is flushed or removed.
+    /// Cancel outstanding screenshots with one error reply each, end per-viewport IME reset
+    /// state, and shut the session down so its recovery journal is flushed or removed.
     fn on_exit(&mut self) {
         // Late screenshot callbacks now find a dropped slot and write nothing; clients get one error.
         capture::cancel_all(self);
         for viewport in self.ime_viewports.drain(..) {
-            self.ime_context.end_viewport(viewport);
             self.ime_reset.end_viewport(viewport);
         }
-        self.ime_observed_pass = None;
         // Flush the recovery journal and stop the auto-save worker; a session with nothing unsaved
         // removes its journal, one with unsaved changes keeps it for the next launch.
         self.session.shutdown();
@@ -2863,6 +2962,22 @@ mod clipboard_key_tests {
         assert_eq!(events.len(), 3);
         assert!(matches!(events[0], Event::Text(_)));
         assert!(matches!(events[1], Event::Copy));
+    }
+}
+
+#[cfg(test)]
+mod forwarded_key_tests {
+    use egui::{Event, Key, Modifiers};
+
+    /// A key a floating native window left over runs the main window's bindings.
+    #[test]
+    fn forwarded_keys_fire_shortcuts() {
+        let mut app = super::FilmcraftApp::new(filmcraft_engine::Session::default());
+        app.bindings = super::menus::bindings(&app);
+        app.ui.focused = crate::dock::PanelKind::Timeline;
+        let shift_backtick = Event::Key { key: Key::Backtick, physical_key: Some(Key::Backtick), pressed: true, repeat: false, modifiers: Modifiers::SHIFT };
+        app.handle_forwarded_keys(&egui::Context::default(), vec![Event::Text("~".into()), shift_backtick]);
+        assert_eq!(app.ui.keys.maximized, Some(crate::dock::PanelKind::Timeline), "Shift+` maximizes the focused frame");
     }
 }
 
@@ -3705,25 +3820,113 @@ mod native_menu_tests {
         let mut app = FilmcraftApp::new(Session::default());
         let sink = sent.clone();
         app.hooks.menu_changed = Some(Box::new(move |items: &[menus::MenuItem]| sink.borrow_mut().push(items.to_vec())));
+        let ctx = egui::Context::default();
 
-        app.sync_native_menu();
+        app.sync_native_menu(&ctx);
         let last = |sent: &Rc<RefCell<Vec<Vec<menus::MenuItem>>>>, id: &str| sent.borrow().last().and_then(|items| enabled(items, id));
         assert_eq!(last(&sent, "edit.undo"), Some(false), "nothing to undo in an empty project");
         assert_eq!(last(&sent, "edit.redo"), Some(false), "nothing to redo in an empty project");
         assert_eq!(last(&sent, "file.newProject"), Some(true));
 
-        app.sync_native_menu();
+        app.sync_native_menu(&ctx);
         assert_eq!(sent.borrow().len(), 1, "an unchanged menu is not sent again");
 
         app.session.execute("file.newSequence", json!({"width":16,"height":16})).unwrap();
-        app.sync_native_menu();
+        app.sync_native_menu(&ctx);
         assert_eq!(last(&sent, "edit.undo"), Some(true), "an edit can be undone");
         assert_eq!(last(&sent, "edit.redo"), Some(false));
 
         app.session.execute("edit.undo", json!({})).unwrap();
-        app.sync_native_menu();
+        app.sync_native_menu(&ctx);
         assert_eq!(last(&sent, "edit.undo"), Some(false));
         assert_eq!(last(&sent, "edit.redo"), Some(true), "the undone edit can be redone");
+    }
+}
+
+#[cfg(test)]
+mod native_window_input_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    use craft_ui::docking::WindowFiles;
+    use egui_kittest::Harness;
+    use filmcraft_engine::Session;
+
+    #[derive(Debug)]
+    struct OsFile(PathBuf);
+
+    impl egui::DroppedFile for OsFile {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+    }
+
+    fn step(h: &mut Harness<'static, FilmcraftApp>) {
+        let ctx = h.ctx.clone();
+        let mut raw = std::mem::take(h.input_mut());
+        eframe::App::raw_input_hook(h.state_mut(), &ctx, &mut raw);
+        *h.input_mut() = raw;
+        ctx.request_repaint();
+        h.step();
+    }
+
+    fn clips(h: &Harness<'static, FilmcraftApp>) -> usize {
+        h.state().session.active_sequence().map_or(0, |q| q.video_tracks.iter().map(|t| t.items.len()).sum())
+    }
+
+    /// Files dropped on a dock panel in its own OS window are imported; on the Timeline they are
+    /// placed at the pointer, by the Timeline drawn in that window only.
+    #[test]
+    fn files_dropped_on_native_windows_import_and_reach_their_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let still = dir.path().join("native_window_drop.png");
+        image::RgbaImage::from_pixel(64, 36, image::Rgba([40, 140, 220, 255])).save(&still).unwrap();
+        let mut s = Session::default();
+        s.execute("file.openDemoProject", json!({})).unwrap();
+        s.execute("file.newSequence", json!({"name": "Drop test", "width": 1280, "height": 720, "fps": 24})).unwrap();
+        let mut h = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).build_eframe(move |_cc| FilmcraftApp::new(s));
+        for _ in 0..4 {
+            step(&mut h);
+        }
+        let row = h.state().auto.find("timeline.track.V1.target").unwrap().rect;
+        let panel = h.state().auto.find("panel.Timeline").unwrap().rect;
+        let at = egui::pos2(panel[0] + h.state().ui.timeline.header_w + 60.0, row[1] + row[3] / 2.0);
+        let drop_files = |h: &mut Harness<'static, FilmcraftApp>, panel: PanelKind, viewport: egui::ViewportId| {
+            let files = WindowFiles { window: 1, viewport, panel, pos: Some(at), hovered: Vec::new(), dropped: vec![Arc::new(OsFile(still.clone()))] };
+            h.state_mut().window_files = vec![files];
+            step(h);
+            step(h);
+        };
+        let items = h.state().session.project.items.len();
+        // another window's Timeline: imported, and the main window's Timeline leaves it
+        drop_files(&mut h, PanelKind::Timeline, egui::ViewportId::from_hash_of("another window"));
+        assert_eq!((h.state().session.project.items.len(), clips(&h)), (items + 1, 0), "status: {}", h.state().ui.status);
+        // a panel other than the Timeline: imported to the bin only
+        drop_files(&mut h, PanelKind::Project, egui::ViewportId::ROOT);
+        assert_eq!((h.state().session.project.items.len(), clips(&h)), (items + 2, 0), "status: {}", h.state().ui.status);
+        // the Timeline drawn in the window the files were dropped on places them
+        drop_files(&mut h, PanelKind::Timeline, egui::ViewportId::ROOT);
+        assert_eq!((h.state().session.project.items.len(), clips(&h)), (items + 3, 1), "status: {}", h.state().ui.status);
+    }
+
+    /// `--control-input-only` drops a native window's own input as the main window's hook does.
+    #[test]
+    fn control_input_only_drops_native_window_input() {
+        let armed = Mutex::new(HashMap::new());
+        let mut raw = egui::RawInput { viewport_id: egui::ViewportId::from_hash_of("palette"), ..Default::default() };
+        raw.events = vec![egui::Event::Text("typing".into()), egui::Event::PointerMoved(egui::pos2(4.0, 4.0))];
+        raw.hovered_files.push(Default::default());
+        raw.dropped_files.push(Arc::new(OsFile(PathBuf::from("/unrelated-input.txt"))));
+        let mut kept = raw.clone();
+        rewrite_native_window_input(false, &armed, &mut kept);
+        assert_eq!(kept.events.len(), 2);
+        assert_eq!(kept.dropped_files.len(), 1);
+        rewrite_native_window_input(true, &armed, &mut raw);
+        assert!(raw.events.is_empty() && raw.hovered_files.is_empty() && raw.dropped_files.is_empty());
     }
 }
 
