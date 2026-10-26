@@ -48,11 +48,18 @@ fn hybrid(s: &Stream, fail_after: usize) -> HybridDecoder {
 struct DrainFailure {
     inner: Box<dyn VideoDecoder>,
     calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    withheld: Option<Vec<DecodedFrame>>,
 }
 
 impl VideoDecoder for DrainFailure {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
-        self.inner.decode(sample, pts)
+        let frames = self.inner.decode(sample, pts)?;
+        if let Some(withheld) = &mut self.withheld {
+            withheld.extend(frames);
+            Ok(Vec::new())
+        } else {
+            Ok(frames)
+        }
     }
     fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -61,10 +68,35 @@ impl VideoDecoder for DrainFailure {
     }
     fn reset(&mut self) {
         self.inner.reset();
+        if let Some(withheld) = &mut self.withheld {
+            withheld.clear();
+        }
     }
     fn name(&self) -> &str {
         "failing hardware drain"
     }
+}
+
+#[test]
+fn failed_drain_replays_unreturned_pictures_across_restart_points() {
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    let name = FIXTURES[0].0;
+    let s = read_stream(&named(&ff, name).expect("fixture"));
+    assert!(s.sync.iter().filter(|&&sync| sync).count() > 1, "fixture must cross restart points");
+    let reference = decode_all(filmcraft_codecs::software_video_decoder(&s.entry).unwrap().as_mut(), &s.samples);
+    assert_eq!(reference.len(), s.samples.len(), "fixture has one picture per access unit");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Decode every input but defer publication until drain; timing cannot retire the replay prefix.
+    let hw = DrainFailure { inner: filmcraft_codecs::software_video_decoder(&s.entry).unwrap(), calls: calls.clone(), withheld: Some(Vec::new()) };
+    let info = NalStreamInfo::from_entry(&s.entry).unwrap().unwrap();
+    let mut hybrid = HybridDecoder::new(Box::new(hw), s.entry.clone(), info);
+    for (data, pts) in &s.samples {
+        assert!(hybrid.decode(data, *pts).unwrap().is_empty(), "no pictures published before drain");
+    }
+    let out = hybrid.flush().unwrap();
+    assert!(!hybrid.is_hardware());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1, "failed drain must not be retried");
+    assert_same(name, &out, &reference);
 }
 
 #[test]
@@ -75,7 +107,7 @@ fn failed_hardware_drain_replays_once_without_losing_or_repeating_pictures() {
         let s = read_stream(&path);
         let reference = decode_all(filmcraft_codecs::software_video_decoder(&s.entry).unwrap().as_mut(), &s.samples);
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let hw = DrainFailure { inner: filmcraft_codecs::software_video_decoder(&s.entry).unwrap(), calls: calls.clone() };
+        let hw = DrainFailure { inner: filmcraft_codecs::software_video_decoder(&s.entry).unwrap(), calls: calls.clone(), withheld: None };
         let info = NalStreamInfo::from_entry(&s.entry).unwrap().unwrap();
         let mut hybrid = HybridDecoder::new(Box::new(hw), s.entry.clone(), info);
         let mut out = Vec::new();
@@ -97,7 +129,7 @@ fn failed_hardware_drain_reports_unavailable_software_replay() {
     let path = named(&ff, FIXTURES[0].0).expect("fixture");
     let s = read_stream(&path);
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let hw = DrainFailure { inner: filmcraft_codecs::software_video_decoder(&s.entry).unwrap(), calls: calls.clone() };
+    let hw = DrainFailure { inner: filmcraft_codecs::software_video_decoder(&s.entry).unwrap(), calls: calls.clone(), withheld: None };
     let info = NalStreamInfo::from_entry(&s.entry).unwrap().unwrap();
     let mut unsupported = s.entry.clone();
     unsupported.codec = filmcraft_isobmff::CodecConfig::Unknown { fourcc: filmcraft_isobmff::FourCc(*b"none"), raw: Vec::new() };
