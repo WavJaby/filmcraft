@@ -1,5 +1,21 @@
 use super::*;
 
+/// The transform trial's bit estimate of a level `v`: `0.4` for zero, `3 + 2·log2|v|` otherwise.
+/// Levels below 256 (nearly all) read it from a table of exactly those values.
+#[inline]
+fn level_bits(table: &[f64; 256], v: i16) -> f64 {
+    let a = v.unsigned_abs();
+    match table.get(usize::from(a)) {
+        Some(&b) => b,
+        None => 3.0 + 2.0 * (a as f64).log2(),
+    }
+}
+
+fn level_bits_table() -> &'static [f64; 256] {
+    static T: std::sync::OnceLock<[f64; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::array::from_fn(|a| if a == 0 { 0.4 } else { 3.0 + 2.0 * (a as f64).log2() }))
+}
+
 impl<'a, 'b> SliceEnc<'a, 'b> {
     // ------------------------------------------------------------------ residual coding helpers
 
@@ -244,45 +260,46 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
     /// Code an inter candidate's residual given its luma/chroma prediction.
     pub(super) fn code_inter(&self, src: &Src, py: &[u8; 256], pu: &[u8; 64], pv: &[u8; 64], qp: u8, c: &mut Cand) {
         let t8_allowed = self.f.p.t8x8;
-        let use8 = if t8_allowed {
+        let (use8, cbpl) = if t8_allowed {
             if self.f.p.adaptive_t8 {
-                // Compare 4x4 and 8x8 transform by SSD + lambda * (approximate) bits.
-                let mut c4 = c.clone();
-                let cbp4 = self.code_luma4(&src.y, py, qp, Deadzone::INTER, self.f.p.decimate, &mut c4);
+                // Compare 4x4 and 8x8 transform by SSD + lambda * (approximate) bits. Neither
+                // coder reads the fields it writes, so the 4x4 trial is coded into `c` itself
+                // and the 8x8 trial into a copy that replaces `c` when it wins: the winner is
+                // not coded a second time.
                 let mut c8 = c.clone();
                 let cbp8 = self.code_luma8(&src.y, py, qp, Deadzone::INTER, self.f.p.decimate, &mut c8);
+                let cbp4 = self.code_luma4(&src.y, py, qp, Deadzone::INTER, self.f.p.decimate, c);
                 let lam = self.f.lam.ssd[qp as usize];
+                let lb = level_bits_table();
                 let cost = |cc: &Cand, cbp: u8, eight: bool| {
                     let d = ssd(&src.y, 16, &cc.ry, 16, 16, 16) as f64;
                     let mut bits = 0f64;
                     if eight {
                         for b in 0..4 {
                             if (cbp >> b) & 1 != 0 {
-                                bits += cc.code.luma8[b].iter().map(|&v| if v == 0 { 0.4 } else { 3.0 + 2.0 * (v.unsigned_abs() as f64).log2() }).sum::<f64>();
+                                bits += cc.code.luma8[b].iter().map(|&v| level_bits(lb, v)).sum::<f64>();
                             }
                         }
                     } else {
                         for b in 0..16 {
                             if (cbp >> (b / 4)) & 1 != 0 {
-                                bits += 1.0
-                                    + cc.code.luma4[b].iter().map(|&v| if v == 0 { 0.4 } else { 3.0 + 2.0 * (v.unsigned_abs() as f64).log2() }).sum::<f64>();
+                                bits += 1.0 + cc.code.luma4[b].iter().map(|&v| level_bits(lb, v)).sum::<f64>();
                             }
                         }
                     }
                     d + lam * bits
                 };
-                let _ = (cbp4, cbp8);
-                cost(&c8, cbp8, true) <= cost(&c4, cbp4, false)
+                if cost(&c8, cbp8, true) <= cost(c, cbp4, false) {
+                    *c = c8;
+                    (true, cbp8)
+                } else {
+                    (false, cbp4)
+                }
             } else {
-                true
+                (true, self.code_luma8(&src.y, py, qp, Deadzone::INTER, self.f.p.decimate, c))
             }
         } else {
-            false
-        };
-        let cbpl = if use8 {
-            self.code_luma8(&src.y, py, qp, Deadzone::INTER, self.f.p.decimate, c)
-        } else {
-            self.code_luma4(&src.y, py, qp, Deadzone::INTER, self.f.p.decimate, c)
+            (false, self.code_luma4(&src.y, py, qp, Deadzone::INTER, self.f.p.decimate, c))
         };
         c.code.t8x8 = use8 && cbpl != 0;
         c.info.t8x8 = c.code.t8x8;

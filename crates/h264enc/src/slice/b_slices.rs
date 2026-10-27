@@ -48,8 +48,9 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
     }
 
     /// B 16x8 / 8x16 candidate: search each partition in both lists, choose L0/L1/Bi per partition, then derive
-    /// the motion vector predictors in decoding order from the chosen directions.
-    fn b_partition(&self, mx: usize, my: usize, part: Part, src: &Src, qp: u8, lam: u32, seeds: [Mv; 2]) -> Option<Box<Cand>> {
+    /// the motion vector predictors in decoding order from the chosen directions. With `beat`, a
+    /// candidate whose cost does not come below it is `None` before its residual is coded.
+    fn b_partition(&self, mx: usize, my: usize, part: Part, src: &Src, qp: u8, lam: u32, seeds: [Mv; 2], beat: Option<u64>) -> Option<Box<Cand>> {
         let f = self.f;
         let rp = [f.l0?, f.l1?];
         let (px, py) = (mx * 16, my * 16);
@@ -84,6 +85,9 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             }
             cost += bestd.0;
             dirs[pi] = bestd.1 as u8;
+            if beat.is_some_and(|b| cost >= b) {
+                return None;
+            }
             let s = srcs[bestd.1];
             for r in y..y + h {
                 py_[r * 16 + x..r * 16 + x + w].copy_from_slice(&s.0[r * 16 + x..r * 16 + x + w]);
@@ -244,8 +248,15 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
         let (py_, pu, pv) = if dir == 2 { bi } else { preds[dir] };
         ci.cost = costs[dir];
         let better_than_direct = best.as_ref().is_none_or(|b| ci.cost < b.cost);
+        // Without RD only costs decide from here on: the 16x16 candidate's residual is coded at
+        // the end, if it is still the best then.
+        let mut deferred = false;
         if better_than_direct || f.p.rd {
-            self.code_inter(src, &py_, &pu, &pv, qp, &mut ci);
+            if f.p.rd {
+                self.code_inter(src, &py_, &pu, &pv, qp, &mut ci);
+            } else {
+                deferred = true;
+            }
             best = Some(match best {
                 None => ci,
                 Some(b) => {
@@ -261,10 +272,13 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
         // --- 16x8 / 8x16 partitions with a per-partition prediction direction
         if f.p.partitions && best.cost > 256 * 4 {
             for part in [Part::P16x8, Part::P8x16] {
-                if let Some(c) = self.b_partition(mx, my, part, src, qp, lam, [res[0].0, res[1].0]) {
+                // without RD only the cost decides, so a losing candidate's residual is not coded
+                let beat = (!f.p.rd).then_some(best.cost);
+                if let Some(c) = self.b_partition(mx, my, part, src, qp, lam, [res[0].0, res[1].0], beat) {
                     let better = if f.p.rd { self.rd_cost(mx, my, &c, src, qp) < self.rd_cost(mx, my, &best, src, qp) } else { c.cost < best.cost };
                     if better {
                         best = c;
+                        deferred = false;
                     }
                 }
             }
@@ -279,6 +293,9 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             } else if ic.cost < best.cost {
                 return ic;
             }
+        }
+        if deferred {
+            self.code_inter(src, &py_, &pu, &pv, qp, &mut best);
         }
         best
     }
