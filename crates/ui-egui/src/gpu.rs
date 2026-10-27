@@ -46,6 +46,69 @@ pub fn gpu_compositor_unsupported(adapter: &eframe::wgpu::Adapter) -> Option<Str
 mod gpu_fallback_tests {
     use filmcraft_render::plan::{FramePlan, PlanLayer};
 
+    /// Parent waits for the named child test; child returns false to run the body.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn isolated_gpu_test(name: &str) -> bool {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        const CHILD_ENV: &str = "FILMCRAFT_UI_GPU_TEST_CHILD";
+        // Existing GPU-child watchdog; separate from the monitor's five-second settle budget.
+        const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+        const CHILD_POLL: Duration = Duration::from_millis(10);
+        let module = module_path!().split_once("::").unwrap().1;
+        let test = format!("{module}::{name}");
+        if std::env::var(CHILD_ENV).ok().as_deref() == Some(test.as_str()) {
+            eprintln!("GPU isolation child entered: {test}");
+            return false;
+        }
+        let policy = filmcraft_codecs::hw::gpu_frames();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(CHILD_ENV, &test)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let passed = format!("test {test} ... ok");
+        // Drain while the child runs; a full stdout pipe must not masquerade as a GPU hang.
+        let reader = std::thread::spawn(move || {
+            let mut named_test_passed = false;
+            for line in std::io::BufReader::new(stdout).lines() {
+                let line = line.unwrap();
+                named_test_passed |= line == passed;
+                println!("{line}");
+            }
+            named_test_passed
+        });
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                let named_test_passed = reader.join().unwrap();
+                assert!(status.success(), "GPU child {test}: {status}");
+                assert!(named_test_passed, "GPU child did not run the named test: {test}");
+                assert_eq!(filmcraft_codecs::hw::gpu_frames(), policy, "GPU child changed its parent's policy");
+                eprintln!("GPU isolation parent policy unchanged: {test}, gpu_frames={policy}");
+                return true;
+            }
+            if start.elapsed() >= CHILD_DEADLINE {
+                let kill = child.kill();
+                let wait = child.wait();
+                let _ = reader.join();
+                panic!("GPU child {test} exceeded {CHILD_DEADLINE:?}; kill={kill:?}, wait={wait:?}");
+            }
+            std::thread::sleep(CHILD_POLL);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    #[should_panic(expected = "GPU child did not run the named test")]
+    fn child_isolation_rejects_zero_matching_tests() {
+        isolated_gpu_test("missing_gpu_child_probe");
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn destroyed_device_program_monitor_outputs_changed_cpu_frames() {
@@ -56,30 +119,10 @@ mod gpu_fallback_tests {
         use std::sync::{Arc, atomic::Ordering};
         use std::time::{Duration, Instant};
 
-        const TEST: &str = "gpu::gpu_fallback_tests::destroyed_device_program_monitor_outputs_changed_cpu_frames";
-        const CHILD_ENV: &str = "FILMCRAFT_PREVIEW_DEVICE_LOSS_CHILD";
-        // Bound driver/readback hangs separately from the monitor's normal settle deadline.
-        const CHILD_DEADLINE: Duration = Duration::from_secs(60);
-        const CHILD_POLL: Duration = Duration::from_millis(10);
         // Same five-second settle budget as screenshot capture; a watchdog, not a speed assertion.
         const FRAME_DEADLINE: Duration = Duration::from_secs(5);
-        if std::env::var_os(CHILD_ENV).is_none() {
-            // Device destruction + decoder policy changes stay out of parallel UI tests.
-            let mut child =
-                std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", TEST, "--nocapture"]).env(CHILD_ENV, "1").spawn().unwrap();
-            let start = Instant::now();
-            loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    assert!(status.success(), "preview device-loss child: {status}");
-                    return;
-                }
-                if start.elapsed() >= CHILD_DEADLINE {
-                    let kill = child.kill();
-                    let wait = child.wait();
-                    panic!("preview device-loss child exceeded {CHILD_DEADLINE:?}; kill={kill:?}, wait={wait:?}");
-                }
-                std::thread::sleep(CHILD_POLL);
-            }
+        if isolated_gpu_test("destroyed_device_program_monitor_outputs_changed_cpu_frames") {
+            return;
         }
 
         fn picture(app: &mut crate::FilmcraftApp, ctx: &egui::Context, target: crate::frames::Target, frame: i64) -> (crate::FrameKey, egui::FullOutput) {
@@ -209,6 +252,10 @@ mod gpu_fallback_tests {
 
     #[test]
     fn review_regression_returned_compositor_error_disables_gpu_and_reports_failure() {
+        #[cfg(not(target_arch = "wasm32"))]
+        if isolated_gpu_test("review_regression_returned_compositor_error_disables_gpu_and_reports_failure") {
+            return;
+        }
         use crate::*;
         use filmcraft_frame::{Chroma, GpuPixels, GpuSurface, PixelData, VideoFrame};
         use std::sync::{
@@ -266,10 +313,17 @@ mod gpu_fallback_tests {
         };
         let plan = frames::GpuPlan { prepared: filmcraft_gpu::prepare(&plan), plan };
         let key = FrameKey { target: frames::Target::SequencePlan(filmcraft_project::ItemId(1)), frame: 0, size: 1000, revision: 0, draft: false };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            filmcraft_codecs::hw::set_gpu_frames(true);
+            assert!(filmcraft_codecs::hw::gpu_frames(), "child policy control must enable GPU frames");
+        }
         assert!(app.gpu_present(key, &plan).is_none());
         assert_eq!(surface.0.load(Ordering::Relaxed), 1, "failure probe must execute");
         assert!(app.frames.take_error().unwrap().contains(FAILURE));
         assert!(app.gpu.is_none(), "next monitor pass must select CPU compositing");
+        assert!(!filmcraft_codecs::hw::gpu_frames(), "returned error must retire GPU-frame decoding inside the child");
+        eprintln!("Returned-error child: failure probe executed, GPU retired, GPU-frame policy disabled");
     }
 
     /// Software rasterizers must not be treated as a GPU compositor: the preview crawled while
