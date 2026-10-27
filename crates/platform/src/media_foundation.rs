@@ -429,7 +429,7 @@ impl Drop for MfDecoder {
 }
 
 #[cfg(test)]
-#[path = "../../tests/it/common/mod.rs"]
+#[path = "../tests/it/common/mod.rs"]
 mod test_common;
 
 #[cfg(test)]

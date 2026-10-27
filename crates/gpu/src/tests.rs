@@ -71,12 +71,12 @@ fn cpu_and_gpu_source_ids_do_not_alias() {
     });
     let gpu = VideoFrame { data: PixelData::Gpu(filmcraft_frame::GpuPixels::new(surface, Chroma::C420, 8)), ..cpu.clone() };
     let mut compositor = GpuCompositor::new(&dev, &queue);
-    let cpu_key = compositor.upload(&cpu, None).unwrap();
-    let gpu_key = compositor.upload(&gpu, None).unwrap();
-    assert_ne!(cpu_key, gpu_key, "CPU allocations and GPU surfaces have separate identity namespaces");
-    assert_eq!(compositor.upload(&gpu, None).unwrap(), gpu_key);
-    assert_eq!(compositor.uploads[&gpu_key].kind, 3, "the GPU key must retain imported planes");
-    assert_eq!(compositor.uploads[&cpu_key].kind, 0, "the CPU key must retain its RGBA upload");
+    let cpu_upload = compositor.upload(&cpu, None).unwrap();
+    let gpu_upload = compositor.upload(&gpu, None).unwrap();
+    assert!(!Arc::ptr_eq(&cpu_upload, &gpu_upload), "CPU allocations and GPU surfaces have separate identity namespaces");
+    assert!(Arc::ptr_eq(&compositor.upload(&gpu, None).unwrap(), &gpu_upload));
+    assert_eq!(gpu_upload.kind, 3, "the GPU source must retain imported planes");
+    assert_eq!(cpu_upload.kind, 0, "the CPU source must retain its RGBA upload");
 }
 
 #[test]
@@ -102,6 +102,7 @@ fn imported_sources_obey_cache_budget_and_release_evicted_owners() {
     let chroma = texture(wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }, wgpu::TextureFormat::Rg8Unorm);
     let mut c = GpuCompositor::new(&dev, &q);
     let mut owners = Vec::new();
+    let mut active = Vec::new();
     for id in 1..=(SOURCE_CACHE_CAPACITY * 2) {
         let surface = Arc::new(CacheSurface { id: id as u64, luma: luma.clone(), chroma: chroma.clone() });
         owners.push(Arc::downgrade(&surface));
@@ -113,9 +114,11 @@ fn imported_sources_obey_cache_budget_and_release_evicted_owners() {
             par: (1, 1),
             pts: Default::default(),
         };
-        c.upload(&f, None).unwrap();
+        active.push(c.upload(&f, None).unwrap());
         assert!(c.uploads.len() <= SOURCE_CACHE_CAPACITY);
     }
+    assert!(owners.iter().all(|w| w.strong_count() > 0), "active imports retain owners beyond cache eviction");
+    drop(active);
     assert_eq!(owners.iter().filter(|w| w.strong_count() > 0).count(), SOURCE_CACHE_CAPACITY);
     assert!(owners[..SOURCE_CACHE_CAPACITY].iter().all(|w| w.strong_count() == 0));
     assert_eq!(c.uploaded_bytes, 0);
@@ -150,6 +153,49 @@ fn oversized_export_plans_decline_gpu_before_upload() {
         let cpu = execute_cpu(&plan).expect("CPU fallback reference");
         assert_eq!((cpu.w, cpu.h), (output_width, 1));
         assert_eq!(&cpu.px[..red.len()], &[1.0, 0.0, 0.0, 1.0], "CPU reference retains the first opaque red pixel");
+    }
+}
+
+#[test]
+fn active_plan_sources_survive_cache_eviction() {
+    let Some((dev, queue)) = device() else {
+        eprintln!("SKIPPED: no GPU adapter for active-plan ownership regression");
+        return;
+    };
+    // Disjoint unit pixels: opaque sRGB primaries equal linear primaries; no reference renderer needed.
+    let colors = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+    let mut compositor = GpuCompositor::new(&dev, &queue);
+    for count in [SOURCE_CACHE_CAPACITY, SOURCE_CACHE_CAPACITY + 1] {
+        let layers: Vec<_> = (0..count)
+            .map(|i| {
+                PlanLayer::new(
+                    Arc::new(VideoFrame::rgba8(1, 1, colors[i % colors.len()].to_vec())),
+                    Affine { e: i as f64, ..Affine::IDENTITY },
+                    1.0,
+                    Blend::Normal,
+                )
+            })
+            .collect();
+        let ids: std::collections::HashSet<_> = layers
+            .iter()
+            .map(|l| match &l.frame.data {
+                PixelData::Rgba8(px) => Arc::as_ptr(px),
+                _ => unreachable!("fixture uses RGBA8"),
+            })
+            .collect();
+        assert_eq!(ids.len(), count, "each input must have a distinct source identity");
+        let plan = FramePlan::Layers { width: count, height: 1, layers };
+        let expected: Vec<u8> = (0..count).flat_map(|i| colors[i % colors.len()]).collect();
+        let linear: Vec<f32> = expected.iter().map(|v| f32::from(*v) / f32::from(u8::MAX)).collect();
+        for prepared in [false, true] {
+            let prep = prepared.then(|| prepare(&plan));
+            compositor.composite_prepared(&plan, prep.as_ref()).expect("preview must retain every active source");
+            assert_eq!(compositor.read_output().expect("preview pixels"), (count as u32, 1, expected.clone()));
+            let exported = compositor.render_export_prepared(&plan, prep.as_ref()).expect("export must retain every active source");
+            assert_eq!(exported, Some((count as u32, 1, linear.clone())));
+            assert_eq!(compositor.uploads.len(), SOURCE_CACHE_CAPACITY, "active plans must not enlarge the reuse cache");
+            eprintln!("active-plan ownership: {count} distinct sources, prepared={prepared}, preview/export pixels verified");
+        }
     }
 }
 
@@ -252,6 +298,33 @@ fn imported_yuv_preserves_managed_input_transform() {
     // More than twenty codes distinguishes the unmanaged control from the two-code rounding allowance.
     assert!(max_error(&unmanaged) > 20, "fixture must respond to input color management");
     assert_eq!(compositor.uploaded_bytes, 0, "resident import uploaded CPU pixels");
+}
+
+#[test]
+fn failed_readback_wait_releases_the_buffer_for_the_next_frame() {
+    let Some((dev, queue)) = device() else {
+        eprintln!("SKIPPED: no GPU adapter for readback lifetime regression");
+        return;
+    };
+    let plan = |rgba: [u8; 4]| FramePlan::Layers {
+        width: 1,
+        height: 1,
+        layers: vec![PlanLayer::new(Arc::new(VideoFrame::rgba8(1, 1, rgba.to_vec())), Affine::IDENTITY, 1.0, Blend::Normal)],
+    };
+    let mut compositor = GpuCompositor::new(&dev, &queue);
+    let red = plan([255, 0, 0, 255]);
+    assert_eq!(compositor.render_export_prepared(&red, None).unwrap(), Some((1, 1, vec![1.0, 0.0, 0.0, 1.0])));
+    let buffer = compositor.accum_readback_buf.as_ref().unwrap().0.clone();
+    eprintln!("readback lifetime: healthy red control passed");
+    FAIL_NEXT_MAP_WAIT.with(|fail| fail.set(true));
+    assert!(compositor.render_export_prepared(&red, None).unwrap().is_none(), "injected wait failure must decline readback");
+    assert!(!FAIL_NEXT_MAP_WAIT.with(|fail| fail.get()), "the real readback path must consume the injected failure");
+    eprintln!("readback lifetime: map requested and wait failure consumed");
+    let green = plan([0, 255, 0, 255]);
+    assert_eq!(compositor.render_export_prepared(&green, None).unwrap(), Some((1, 1, vec![0.0, 1.0, 0.0, 1.0])));
+    assert_eq!(&buffer, &compositor.accum_readback_buf.as_ref().unwrap().0, "recovery must reuse the same staging buffer");
+    assert_eq!(compositor.render_export_prepared(&red, None).unwrap(), Some((1, 1, vec![1.0, 0.0, 0.0, 1.0])));
+    eprintln!("readback lifetime: same-buffer green then red pixels verified");
 }
 
 #[derive(Debug)]

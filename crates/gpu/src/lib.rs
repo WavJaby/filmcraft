@@ -92,7 +92,6 @@ struct Uploaded {
     /// Multiplier from the alpha texture's sample to alpha 0..1; 0 when the frame has no alpha plane.
     alpha_scale: f32,
     chroma: (u32, u32),
-    last_used: u64,
     /// Keep source owners alive; freed CPU addresses may be reused while textures remain cached.
     _pixels: PixelData,
     /// Keeps imported (zero-copy) planes' memory alive.
@@ -114,7 +113,7 @@ pub struct GpuCompositor {
     backdrop: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
     output: Option<(wgpu::Texture, wgpu::TextureView, (u32, u32))>,
     accum_readback_buf: Option<(wgpu::Buffer, u64)>,
-    uploads: HashMap<SourceKey, Uploaded>,
+    uploads: HashMap<SourceKey, (u64, Arc<Uploaded>)>,
     clock: u64,
     dummy: wgpu::TextureView,
     /// The effect stage (None on devices without compute shaders or storage textures: layers
@@ -510,7 +509,7 @@ impl GpuCompositor {
     }
 
     /// Upload (or reuse) the textures of a frame, using `prep` when it was converted beforehand.
-    fn upload(&mut self, f: &VideoFrame, prep: Option<&Prepared>) -> Result<SourceKey, String> {
+    fn upload(&mut self, f: &VideoFrame, prep: Option<&Prepared>) -> Result<Arc<Uploaded>, String> {
         let id = match &f.data {
             PixelData::Rgba8(d) => SourceId::Cpu(Arc::as_ptr(d) as *const u8 as usize),
             PixelData::RgbaF32(d) => SourceId::Cpu(Arc::as_ptr(d) as *const u8 as usize),
@@ -520,17 +519,14 @@ impl GpuCompositor {
         };
         let key = (id, f.width, f.height);
         self.clock += 1;
-        if let Some(u) = self.uploads.get_mut(&key) {
-            u.last_used = self.clock;
-            return Ok(key);
+        if let Some((last_used, uploaded)) = self.uploads.get_mut(&key) {
+            *last_used = self.clock;
+            return Ok(Arc::clone(uploaded));
         }
         let (w, h) = (f.width, f.height);
         if let PixelData::Gpu(g) = &f.data {
             match self.import(g, f) {
-                Ok(up) => {
-                    self.cache_source(key, up);
-                    return Ok(key);
-                }
+                Ok(up) => return Ok(self.cache_source(key, up)),
                 Err(e) => {
                     // no zero-copy here (not the decoder's adapter, no importer): read it back once
                     log::warn!("zero-copy import of a decoded picture failed ({e}); uploading it instead");
@@ -550,7 +546,6 @@ impl GpuCompositor {
                     code_scale: 1.0,
                     alpha_scale: 0.0,
                     chroma: (w, h),
-                    last_used: self.clock,
                     _pixels: f.data.clone(),
                     _keep: None,
                 }
@@ -571,7 +566,6 @@ impl GpuCompositor {
                     code_scale: 1.0,
                     alpha_scale: 0.0,
                     chroma: (w, h),
-                    last_used: self.clock,
                     _pixels: f.data.clone(),
                     _keep: None,
                 }
@@ -590,7 +584,6 @@ impl GpuCompositor {
                     code_scale: 255.0,
                     alpha_scale,
                     chroma: (cw, ch),
-                    last_used: self.clock,
                     _pixels: f.data.clone(),
                     _keep: None,
                 }
@@ -620,7 +613,6 @@ impl GpuCompositor {
                     code_scale: scale,
                     alpha_scale,
                     chroma: (cw, ch),
-                    last_used: self.clock,
                     _pixels: f.data.clone(),
                     _keep: None,
                 }
@@ -628,19 +620,20 @@ impl GpuCompositor {
             // handled above
             PixelData::Gpu(_) => return Err("GPU surface was not imported".into()),
         };
-        self.cache_source(key, up);
-        Ok(key)
+        Ok(self.cache_source(key, up))
     }
 
-    fn cache_source(&mut self, key: SourceKey, up: Uploaded) {
-        self.uploads.insert(key, up);
+    fn cache_source(&mut self, key: SourceKey, up: Uploaded) -> Arc<Uploaded> {
+        let up = Arc::new(up);
+        self.uploads.insert(key, (self.clock, Arc::clone(&up)));
         if self.uploads.len() > SOURCE_CACHE_CAPACITY {
-            let mut v: Vec<(u64, SourceKey)> = self.uploads.iter().map(|(k, u)| (u.last_used, *k)).collect();
+            let mut v: Vec<(u64, SourceKey)> = self.uploads.iter().map(|(k, (last_used, _))| (*last_used, *k)).collect();
             v.sort_unstable();
             for (_, k) in v.into_iter().take(self.uploads.len() - SOURCE_CACHE_CAPACITY) {
                 self.uploads.remove(&k);
             }
         }
+        up
     }
 
     /// Open a decoder's GPU picture as this device's textures (no copy).
@@ -661,22 +654,20 @@ impl GpuCompositor {
             code_scale: scale,
             alpha_scale: 0.0,
             chroma: (w.div_ceil(2), h.div_ceil(2)),
-            last_used: self.clock,
             _pixels: f.data.clone(),
             _keep: Some(Box::new((planes.luma, planes.chroma, planes.keepalive))),
         })
     }
 
     /// The source description of an uploaded frame.
-    fn src_info(&self, f: &VideoFrame, key: SourceKey) -> Option<SrcInfo> {
-        let up = self.uploads.get(&key)?;
+    fn src_info(f: &VideoFrame, up: &Uploaded) -> SrcInfo {
         let code_levels = match &f.data {
             PixelData::Yuv8 { .. } => 256.0,
             PixelData::Yuv16 { bits, .. } => (*bits as f32).exp2(),
             PixelData::Gpu(g) => (g.bits as f32).exp2(),
             _ => 1.0,
         };
-        Some(SrcInfo {
+        SrcInfo {
             kind: up.kind,
             code_scale: up.code_scale,
             code_levels,
@@ -685,7 +676,7 @@ impl GpuCompositor {
             size: (f.width, f.height),
             color: f.color,
             input: None,
-        })
+        }
     }
 
     fn uniforms(src: &SrcInfo, m: &filmcraft_geom::Affine, opacity: f32, blend: Blend, out: (u32, u32)) -> [f32; UNIFORM_FLOATS] {
@@ -836,7 +827,8 @@ impl GpuCompositor {
             .collect::<Result<Vec<_>, String>>()?;
         let resolved: Vec<&PlanLayer> = layers.iter().zip(&cpu_fx).map(|(l, c)| c.as_ref().unwrap_or(l)).collect();
         let layers = resolved;
-        let keys: Vec<SourceKey> = layers
+        // Active draws own their sources; LRU eviction only releases the cache's reference.
+        let sources: Vec<Arc<Uploaded>> = layers
             .iter()
             .enumerate()
             .map(|(i, l)| {
@@ -854,11 +846,11 @@ impl GpuCompositor {
         if let Some(f) = self.fx.as_mut() {
             f.begin_frame();
         }
-        for (l, k) in layers.iter().zip(&keys) {
-            let src = self.src_info(&l.frame, *k).ok_or("GPU source upload missing during composition")?;
+        for (l, source) in layers.iter().zip(&sources) {
+            let src = Self::src_info(&l.frame, source);
             // HDR / wide-gamut Y'CbCr: the planner's input transform, in the shader (#965)
             let src = SrcInfo { input: l.input.as_ref().filter(|_| matches!(src.kind, 2 | 3)).and_then(|t| t.gpu_params()), ..src };
-            let views = self.uploads.get(k).ok_or("GPU source textures missing during composition")?.views.clone();
+            let views = source.views.clone();
             let job = match &l.fx {
                 Some(lfx) => {
                     // the source drawn onto the working image (box-decimated by n, as the CPU decodes)
@@ -1060,9 +1052,9 @@ impl GpuCompositor {
     /// applied, read back as linear premultiplied RGBA f32 (what `LayerFx` ops produce on the
     /// CPU from the same frame). None when the working image does not fit in a texture.
     pub fn effect_image(&mut self, frame: &VideoFrame, fx: &filmcraft_render::plan::LayerFx) -> Result<Option<(u32, u32, Vec<f32>)>, String> {
-        let key = self.upload(frame, None)?;
-        let src = self.src_info(frame, key).ok_or("GPU source upload missing")?;
-        let views = self.uploads.get(&key).ok_or("GPU source textures missing")?.views.clone();
+        let source = self.upload(frame, None)?;
+        let src = Self::src_info(frame, &source);
+        let views = source.views.clone();
         let n = fx.decimation.max(1) as f64;
         let (w, h) = (fx.size.0.max(1), fx.size.1.max(1));
         let mut su = Self::uniforms(&src, &filmcraft_geom::Affine::scale(1.0 / n, 1.0 / n), 1.0, Blend::Normal, (w, h));
@@ -1100,6 +1092,7 @@ impl GpuCompositor {
         self.queue.submit([enc.finish()]);
         stage.end_frame();
         let slice = buf.slice(..);
+        let mapping = ReadbackMapping(&buf);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -1115,7 +1108,7 @@ impl GpuCompositor {
             out.extend(r.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)));
         }
         drop(data);
-        buf.unmap();
+        drop(mapping);
         Ok(Some((w, h, out)))
     }
 
@@ -1165,6 +1158,7 @@ impl GpuCompositor {
         let t = std::time::Instant::now();
         let (buf, _) = self.accum_readback_buf.as_ref()?;
         let slice = buf.slice(..);
+        let mapping = ReadbackMapping(buf);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -1185,7 +1179,7 @@ impl GpuCompositor {
             true
         });
         drop(data);
-        buf.unmap();
+        drop(mapping);
         export_renderer::timing::add_convert(t.elapsed());
         converted.then_some((w, h, out))
     }
@@ -1208,6 +1202,7 @@ impl GpuCompositor {
         );
         self.queue.submit([enc.finish()]);
         let slice = buf.slice(..);
+        let mapping = ReadbackMapping(&buf);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -1220,13 +1215,31 @@ impl GpuCompositor {
             out.extend_from_slice(&data[(y * row) as usize..(y * row + w * 4) as usize]);
         }
         drop(data);
-        buf.unmap();
+        drop(mapping);
         Some((*w, *h, out))
     }
 }
 
+// Cancel pending or release completed mappings on every exit; mapped views must drop first.
+struct ReadbackMapping<'a>(&'a wgpu::Buffer);
+
+impl Drop for ReadbackMapping<'_> {
+    fn drop(&mut self) {
+        self.0.unmap();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_MAP_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Bound readback after failed hardware encode; radv may never finish an indefinite wait (#1058).
 fn wait_mapped(device: &wgpu::Device) -> Result<(), String> {
+    #[cfg(test)]
+    if FAIL_NEXT_MAP_WAIT.with(|fail| fail.replace(false)) {
+        return Err("injected map wait failure".into());
+    }
     // Eight seconds exceeds a healthy map; timeout lets the existing CPU fallback take the frame.
     const MAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
     device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(MAP_TIMEOUT) }).map(|_| ()).map_err(|e| e.to_string())
