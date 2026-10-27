@@ -124,6 +124,36 @@ fn imported_sources_obey_cache_budget_and_release_evicted_owners() {
 }
 
 #[test]
+fn oversized_export_plans_decline_gpu_before_upload() {
+    let Some((dev, queue)) = device() else {
+        eprintln!("SKIPPED: no GPU adapter for export capability regression");
+        return;
+    };
+    // One texel beyond this device's limit; one row keeps the fixture allocation bounded.
+    let oversized = dev.limits().max_texture_dimension_2d.checked_add(1).expect("device limit leaves a boundary sample");
+    let red = [255, 0, 0, 255];
+    let plan = |source_width: u32, output_width: usize| FramePlan::Layers {
+        width: output_width,
+        height: 1,
+        layers: vec![PlanLayer::new(Arc::new(VideoFrame::rgba8(source_width, 1, red.repeat(source_width as usize))), Affine::IDENTITY, 1.0, Blend::Normal)],
+    };
+    let mut compositor = GpuCompositor::new(&dev, &queue);
+    let healthy = compositor.render_export_prepared(&plan(1, 1), None).unwrap().expect("healthy GPU export control");
+    assert_eq!(healthy, (1, 1, vec![1.0, 0.0, 0.0, 1.0]), "opaque sRGB red is unit linear red");
+    eprintln!("Export capability control: healthy red rendered; texture limit={}", oversized - 1);
+    for (what, source_width, output_width) in [("source", oversized, 1), ("output", 1, oversized as usize)] {
+        let plan = plan(source_width, output_width);
+        let uploads = compositor.uploaded_bytes;
+        let result = compositor.render_export_prepared(&plan, None);
+        assert!(matches!(result, Ok(None)), "oversized {what} must decline GPU before allocation: {result:?}");
+        assert_eq!(compositor.uploaded_bytes, uploads, "unsupported {what} must not upload");
+        let cpu = execute_cpu(&plan).expect("CPU fallback reference");
+        assert_eq!((cpu.w, cpu.h), (output_width, 1));
+        assert_eq!(&cpu.px[..red.len()], &[1.0, 0.0, 0.0, 1.0], "CPU reference retains the first opaque red pixel");
+    }
+}
+
+#[test]
 fn yuv_code_range_uniforms() {
     let mut mismatches = Vec::new();
     for bits in [8, 10, 12, 16] {

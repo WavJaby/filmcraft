@@ -39,6 +39,7 @@ fn software(s: &Stream) -> Box<dyn VideoDecoder> {
 /// after `reset` + reseek to each later sync sample, after a mid-stream `flush`, and a full pass
 /// after all the resets.
 fn parity(name: &str, s: &Stream) {
+    decoder_diagnostics(name);
     let Some(mut hw) = hardware(s) else { return };
     let mut sw = software(s);
     let a = decode_all(hw.as_mut(), &s.samples);
