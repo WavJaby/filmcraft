@@ -3152,6 +3152,10 @@ mod gpu_fallback_tests {
             return;
         };
         eprintln!("Preview loss test adapter: {:?}", adapter.get_info());
+        if let Some(why) = super::gpu_compositor_unsupported(&adapter) {
+            eprintln!("SKIPPED: preview device-loss adapter is unsupported: {why}");
+            return;
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let renderer = egui_wgpu::Renderer::new(&device, format, Default::default());
@@ -3197,7 +3201,7 @@ mod gpu_fallback_tests {
         let (w, h, pixels) = gpu.compositor.read_output().expect("healthy monitor GPU pixels");
         assert_eq!((w, h), gpu.size);
         assert!(!pixels.is_empty());
-        assert!(pixels.chunks_exact(4).all(|p| p == expected[0]), "healthy GPU must show the red matte");
+        assert!(pixels.as_chunks::<4>().0.iter().all(|p| p == &expected[0]), "healthy GPU must show the red matte");
         device.destroy();
         let _ = device.poll(wgpu::PollType::Poll);
         assert!(broken.load(Ordering::Relaxed), "device-lost notification must reach preview policy");
@@ -3226,7 +3230,7 @@ mod gpu_fallback_tests {
             assert_eq!((img.w, img.h), (cpu.w, cpu.h));
             assert_eq!(img.px, cpu.over_black_rgba8(), "normal worker must match the independent source-map reference");
             assert_eq!(uploaded, img.px, "egui upload must contain the rendered CPU pixels");
-            assert!(uploaded.chunks_exact(4).all(|p| p == color), "post-loss monitor must show the next primary matte");
+            assert!(uploaded.as_chunks::<4>().0.iter().all(|p| p == color), "post-loss monitor must show the next primary matte");
             output.textures_delta.clear();
         }
         eprintln!("Preview output: healthy GPU red -> destroyed device -> CPU green/blue; reference/cache/egui upload/draw commands match");

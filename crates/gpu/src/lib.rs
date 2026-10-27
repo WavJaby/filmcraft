@@ -1081,9 +1081,9 @@ impl GpuCompositor {
         self.render_plan(&empty, None, false, true)
     }
 
-    /// Export -> linear premultiplied RGBA f32, without sRGB resolve. Unsupported plans/readback failure -> None; source/render errors propagate.
+    /// Export -> linear premultiplied RGBA f32, without sRGB resolve. Unsupported plan/texture size or readback failure -> None; source/render errors propagate.
     pub fn render_export_prepared(&mut self, plan: &FramePlan, prep: Option<&PreparedPlan>) -> Result<Option<(u32, u32, Vec<f32>)>, String> {
-        if matches!(plan, FramePlan::Composite { .. }) {
+        if matches!(plan, FramePlan::Composite { .. }) || plan.max_side() > self.device.limits().max_texture_dimension_2d as usize {
             return Ok(None);
         }
         let t = std::time::Instant::now();
