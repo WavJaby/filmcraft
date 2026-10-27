@@ -41,6 +41,49 @@ fn oversized_export_plans_decline_gpu_before_upload() {
 }
 
 #[test]
+fn active_plan_sources_survive_cache_eviction() {
+    let Some((dev, queue)) = device() else {
+        eprintln!("SKIPPED: no GPU adapter for active-plan ownership regression");
+        return;
+    };
+    // Disjoint unit pixels: opaque sRGB primaries equal linear primaries; no reference renderer needed.
+    let colors = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+    let mut compositor = GpuCompositor::new(&dev, &queue);
+    for count in [SOURCE_CACHE_CAPACITY, SOURCE_CACHE_CAPACITY + 1] {
+        let layers: Vec<_> = (0..count)
+            .map(|i| {
+                PlanLayer::new(
+                    Arc::new(VideoFrame::rgba8(1, 1, colors[i % colors.len()].to_vec())),
+                    Affine { e: i as f64, ..Affine::IDENTITY },
+                    1.0,
+                    Blend::Normal,
+                )
+            })
+            .collect();
+        let ids: std::collections::HashSet<_> = layers
+            .iter()
+            .map(|l| match &l.frame.data {
+                PixelData::Rgba8(px) => Arc::as_ptr(px),
+                _ => unreachable!("fixture uses RGBA8"),
+            })
+            .collect();
+        assert_eq!(ids.len(), count, "each input must have a distinct source identity");
+        let plan = FramePlan::Layers { width: count, height: 1, layers };
+        let expected: Vec<u8> = (0..count).flat_map(|i| colors[i % colors.len()]).collect();
+        let linear: Vec<f32> = expected.iter().map(|v| f32::from(*v) / f32::from(u8::MAX)).collect();
+        for prepared in [false, true] {
+            let prep = prepared.then(|| prepare(&plan));
+            compositor.composite_prepared(&plan, prep.as_ref()).expect("preview must retain every active source");
+            assert_eq!(compositor.read_output().expect("preview pixels"), (count as u32, 1, expected.clone()));
+            let exported = compositor.render_export_prepared(&plan, prep.as_ref()).expect("export must retain every active source");
+            assert_eq!(exported, Some((count as u32, 1, linear.clone())));
+            assert_eq!(compositor.uploads.len(), SOURCE_CACHE_CAPACITY, "active plans must not enlarge the reuse cache");
+            eprintln!("active-plan ownership: {count} distinct sources, prepared={prepared}, preview/export pixels verified");
+        }
+    }
+}
+
+#[test]
 fn yuv_code_range_uniforms() {
     let mut mismatches = Vec::new();
     for bits in [8, 10, 12, 16] {
@@ -68,6 +111,33 @@ fn yuv_code_range_uniforms() {
         }
     }
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[test]
+fn failed_readback_wait_releases_the_buffer_for_the_next_frame() {
+    let Some((dev, queue)) = device() else {
+        eprintln!("SKIPPED: no GPU adapter for readback lifetime regression");
+        return;
+    };
+    let plan = |rgba: [u8; 4]| FramePlan::Layers {
+        width: 1,
+        height: 1,
+        layers: vec![PlanLayer::new(Arc::new(VideoFrame::rgba8(1, 1, rgba.to_vec())), Affine::IDENTITY, 1.0, Blend::Normal)],
+    };
+    let mut compositor = GpuCompositor::new(&dev, &queue);
+    let red = plan([255, 0, 0, 255]);
+    assert_eq!(compositor.render_export_prepared(&red, None).unwrap(), Some((1, 1, vec![1.0, 0.0, 0.0, 1.0])));
+    let buffer = compositor.accum_readback_buf.as_ref().unwrap().0.clone();
+    eprintln!("readback lifetime: healthy red control passed");
+    FAIL_NEXT_MAP_WAIT.with(|fail| fail.set(true));
+    assert!(compositor.render_export_prepared(&red, None).unwrap().is_none(), "injected wait failure must decline readback");
+    assert!(!FAIL_NEXT_MAP_WAIT.with(|fail| fail.get()), "the real readback path must consume the injected failure");
+    eprintln!("readback lifetime: map requested and wait failure consumed");
+    let green = plan([0, 255, 0, 255]);
+    assert_eq!(compositor.render_export_prepared(&green, None).unwrap(), Some((1, 1, vec![0.0, 1.0, 0.0, 1.0])));
+    assert_eq!(&buffer, &compositor.accum_readback_buf.as_ref().unwrap().0, "recovery must reuse the same staging buffer");
+    assert_eq!(compositor.render_export_prepared(&red, None).unwrap(), Some((1, 1, vec![1.0, 0.0, 0.0, 1.0])));
+    eprintln!("readback lifetime: same-buffer green then red pixels verified");
 }
 
 #[derive(Debug)]
