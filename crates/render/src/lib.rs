@@ -250,7 +250,7 @@ pub(crate) fn render_seq_tracks(
             }
             continue;
         }
-        match item_layer_ex(project, seq, item, t, opts, sources, &tc, true)? {
+        match item_layer_ex(project, seq, item, t, opts, sources, LayerWant { tc: &tc, allow_region: true })? {
             Some(Layer::Full { image, opacity, blend: bl, opaque }) => {
                 if canvas.is_empty() && opaque && opacity == 1.0 && bl == Blend::Normal && (image.w, image.h) == (w, h) {
                     // mixing an opaque layer over transparent black gives the layer itself
@@ -447,7 +447,7 @@ pub(crate) fn item_layer(
     tc: &str,
 ) -> Result<Option<(Image, f32, Blend)>> {
     let (w, h) = output_size(seq, opts.scale);
-    Ok(item_layer_ex(project, seq, item, t, opts, sources, tc, false)?.map(|l| l.into_full(w, h)))
+    Ok(item_layer_ex(project, seq, item, t, opts, sources, LayerWant { tc, allow_region: false })?.map(|l| l.into_full(w, h)))
 }
 
 /// Whether a placement matrix leaves the layer exactly where it is.
@@ -455,12 +455,19 @@ fn identity_placement(m: &Affine) -> bool {
     (m.a - 1.0).abs() < 1e-9 && (m.d - 1.0).abs() < 1e-9 && m.b == 0.0 && m.c == 0.0 && m.e.abs() < 1e-9 && m.f.abs() < 1e-9
 }
 
+/// What [`item_layer_ex`] is asked for: the timecode to burn in and whether it may answer with
+/// only the non-transparent rectangle of the layer.
+#[derive(Clone, Copy)]
+pub(crate) struct LayerWant<'a> {
+    pub tc: &'a str,
+    pub allow_region: bool,
+}
+
 /// [`item_layer`], which may also hand back only the non-transparent rectangle of a layer
 /// (`allow_region`): for a clip of plain media (no effects, no masks, no speed blending, no colour
 /// management, placed as it is) whose frame carries an alpha plane, only the part where alpha is not
 /// zero is converted and mixed, the rest of the layer being transparent anyway; and a frame
 /// without alpha is known to be opaque.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn item_layer_ex(
     project: &Project,
     seq: &Sequence,
@@ -468,9 +475,9 @@ pub(crate) fn item_layer_ex(
     t: Tick,
     opts: RenderOptions,
     sources: &dyn SourceProvider,
-    tc: &str,
-    allow_region: bool,
+    want: LayerWant<'_>,
 ) -> Result<Option<Layer>> {
+    let LayerWant { tc, allow_region } = want;
     let (w, h) = output_size(seq, opts.scale);
     // `mt`: where effects and Motion/Opacity are evaluated (differs from the shown frame's media
     // time inside a frame hold without Hold Filters).
@@ -511,7 +518,7 @@ pub(crate) fn item_layer_ex(
         fetched = Some((src, frame, n));
     }
     let mut layer = match fetched {
-        Some((src, frame, n)) => media_image(project, seq, item, t, &src, &frame, n, want)?,
+        Some((src, frame, n)) => media_image(project, seq, item, t, MediaFrame { src: &src, frame: &frame, n }, want)?,
         None => match base_layer(project, seq, item, t, opts, sources, want)? {
             Some(image) => image,
             None => return Ok(None),
@@ -590,10 +597,18 @@ pub(crate) fn video_source_time(item: &TrackItem, t: Tick, media_rate: filmcraft
     media_rate.tick_of(media_rate.frame_at(ft)).clamp(item.source_in.min(ft), ft)
 }
 
+/// A decoded media frame with the source it came from and its decode index.
+#[derive(Clone, Copy)]
+struct MediaFrame<'a> {
+    src: &'a SharedSource,
+    frame: &'a VideoFrame,
+    n: usize,
+}
+
 /// The linear image of a media clip's `frame`, colour managed, and blended (or, with Optical Flow,
 /// motion interpolated) with the next frame when the clip's speed asks for it.
-#[allow(clippy::too_many_arguments)]
-fn media_image(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick, src: &SharedSource, frame: &VideoFrame, n: usize, want: f32) -> Result<Image> {
+fn media_image(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick, mf: MediaFrame<'_>, want: f32) -> Result<Image> {
+    let MediaFrame { src, frame, n } = mf;
     let img = colorman::decode(project, item.item, frame, n, &seq.settings.color)?;
     Ok(match interpolation_blend(item, t, src.info().frame_rate()) {
         Some((next_time, wgt)) => match src.video_frame(FrameRequest { time: next_time, scale: want }) {
@@ -627,7 +642,7 @@ pub(crate) fn base_layer(
     Ok(Some(match &pi.kind {
         ItemKind::Media(_) | ItemKind::Subclip { .. } => {
             let Some((src, frame, n)) = media_frame(item, t, sources, want, src_size)? else { return Ok(None) };
-            media_image(project, seq, item, t, &src, &frame, n, want)?
+            media_image(project, seq, item, t, MediaFrame { src: &src, frame: &frame, n }, want)?
         }
         ItemKind::Sequence(nested) => {
             let sub = RenderOptions { scale: want, effects: opts.effects, depth: opts.depth + 1, captions: false, working_output: true };
