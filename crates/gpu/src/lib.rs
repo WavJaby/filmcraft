@@ -1026,7 +1026,7 @@ impl GpuCompositor {
                         let (view, _) = rendered?;
                         views[index] = view;
                     }
-                    self.transition.draw(&self.device, &self.queue, &canvas, [&views[0], &views[1]], dims, effect, *progress);
+                    self.transition.draw((&self.device, &self.queue), &canvas, [&views[0], &views[1]], dims, effect, *progress);
                     self.gpu_transitions += 1;
                 }
             }
