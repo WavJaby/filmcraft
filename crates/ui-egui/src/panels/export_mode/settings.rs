@@ -25,7 +25,7 @@ pub(super) fn combo(ui: &mut egui::Ui, reg: &mut Reg, id: &str, selected: &str, 
 /// [`combo`] whose options carry why they are greyed out (label, `Some(reason)` when disabled).
 fn combo_why(ui: &mut egui::Ui, reg: &mut Reg, id: &str, selected: &str, options: &[(String, Option<&str>)], width: f32) -> Option<usize> {
     let mut chosen = None;
-    let r = egui::ComboBox::from_id_salt(id).selected_text(crate::i18n::t(selected)).width(width).show_ui(ui, |ui| {
+    let r = craft_ui::ComboBox::from_id_salt(id).selected_text(crate::i18n::t(selected)).width(width).show_ui(ui, |ui| {
         for (i, (label, why)) in options.iter().enumerate() {
             let enabled = why.is_none();
             let resp = ui.add_enabled(enabled, egui::Button::selectable(label == selected, crate::i18n::t(label)));
@@ -247,8 +247,9 @@ pub(super) fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: R
         });
         // Preset: favourites, then every preset by category, then More presets…
         row(ui, &t, tl!("Preset"), |ui| {
-            let r =
-                egui::ComboBox::from_id_salt("export.preset").selected_text(crate::i18n::t(&ex.preset)).width(ui.available_width() - 4.0).show_ui(ui, |ui| {
+            let r = craft_ui::ComboBox::from_id_salt("export.preset").selected_text(crate::i18n::t(&ex.preset)).width(ui.available_width() - 4.0).show_ui(
+                ui,
+                |ui| {
                     if !favs.is_empty() {
                         ui.label(egui::RichText::new(tl!("Favorites")).color(t.text_dim).size(11.0));
                         for f in &favs {
@@ -272,7 +273,8 @@ pub(super) fn settings_column(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: R
                     if ui.button(tl!("More presets…")).clicked() {
                         open_manager = true;
                     }
-                });
+                },
+            );
             reg.add("export.preset", r.response.rect, ex.preset.clone());
         });
         ui.horizontal(|ui| {

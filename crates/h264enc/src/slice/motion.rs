@@ -1,5 +1,40 @@
 use super::*;
 
+/// Motion vectors already costed in one search: one bit per point of the square of
+/// `2 * half + 1` points (`step` quarter samples apart) around `centre`. A point outside the
+/// square, off the grid or past the `W` words always counts as new.
+struct Visited<const W: usize> {
+    centre: Mv,
+    half: i32,
+    step: i32,
+    bits: [u64; W],
+}
+
+impl<const W: usize> Visited<W> {
+    fn new(centre: Mv, half: i32, step: i32) -> Self {
+        Visited { centre, half, step: step.max(1), bits: [0; W] }
+    }
+
+    /// Marks `m`; false when it was marked before.
+    fn first(&mut self, m: Mv) -> bool {
+        let (dx, dy) = (m.x as i32 - self.centre.x as i32, m.y as i32 - self.centre.y as i32);
+        if dx % self.step != 0 || dy % self.step != 0 {
+            return true;
+        }
+        let side = 2 * self.half + 1;
+        let (gx, gy) = (dx / self.step + self.half, dy / self.step + self.half);
+        if gx < 0 || gy < 0 || gx >= side || gy >= side {
+            return true;
+        }
+        let i = (gy * side + gx) as usize;
+        let Some(word) = self.bits.get_mut(i / 64) else { return true };
+        let bit = 1u64 << (i % 64);
+        let fresh = *word & bit == 0;
+        *word |= bit;
+        fresh
+    }
+}
+
 impl<'a, 'b> SliceEnc<'a, 'b> {
     // ------------------------------------------------------------------ motion estimation
 
@@ -30,13 +65,19 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
         // hexagon search (full-pel units = 4 quarter samples)
         let range = p.me_range;
         let centre0 = best;
+        // a point costed once is never better than the best since: skip it when it comes up again
+        let mut seen = Visited::<40>::new(centre0, range, 4);
+        seen.first(centre0);
         const HEX: [(i32, i32); 6] = [(-2, 0), (2, 0), (-1, -2), (1, -2), (-1, 2), (1, 2)];
         for _ in 0..range {
             let mut moved = false;
             let c = best;
             for &(dx, dy) in &HEX {
                 let m = Mv::new(c.x as i32 + dx * 4, c.y as i32 + dy * 4);
-                if ((m.x as i32 - centre0.x as i32).abs() >> 2) > range || ((m.y as i32 - centre0.y as i32).abs() >> 2) > range || !self.mv_ok(bx, by, w, h, m)
+                if ((m.x as i32 - centre0.x as i32).abs() >> 2) > range
+                    || ((m.y as i32 - centre0.y as i32).abs() >> 2) > range
+                    || !self.mv_ok(bx, by, w, h, m)
+                    || !seen.first(m)
                 {
                     continue;
                 }
@@ -56,7 +97,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             let c = best;
             for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
                 let m = Mv::new(c.x as i32 + dx * 4, c.y as i32 + dy * 4);
-                if !self.mv_ok(bx, by, w, h, m) {
+                if !self.mv_ok(bx, by, w, h, m) || !seen.first(m) {
                     continue;
                 }
                 let k = fcost(m);
@@ -76,6 +117,8 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             satd(src, sstride, buf, 16, w, h) + ((lam * mv_bits(mv, mvp)) >> 8)
         };
         let mut bs = scost(best, &mut buf);
+        let mut seen = Visited::<2>::new(best, 4, 1);
+        seen.first(best);
         if p.subpel >= 1 {
             for step in [2, 1] {
                 if step == 1 && p.subpel < 2 {
@@ -86,7 +129,7 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
                     let c = best;
                     for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)] {
                         let m = Mv::new(c.x as i32 + dx * step, c.y as i32 + dy * step);
-                        if !self.mv_ok(bx, by, w, h, m) {
+                        if !self.mv_ok(bx, by, w, h, m) || !seen.first(m) {
                             continue;
                         }
                         let k = scost(m, &mut buf);
@@ -290,9 +333,15 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
         }
         ci.code.mvd = mvds;
         Self::cand_inter_info(&mut ci, best_part, [[0; 4], [-1; 4]], [best_mvs, [Mv::ZERO; 4]], mvds);
-        self.code_inter(src, &py_, &pu, &pv, qp, &mut ci);
+        // The residual decides a P_Skip and the RD comparisons; otherwise it only matters when the
+        // inter candidate is kept, so it is coded after an intra candidate had its chance.
+        let skip_candidate = best_part == Part::P16x16 && best_mvs[0] == skip_mv && skip_ok;
+        let coded_now = skip_candidate || f.p.rd;
+        if coded_now {
+            self.code_inter(src, &py_, &pu, &pv, qp, &mut ci);
+        }
         ci.cost = best_cost;
-        if ci.code.cbp == 0 && best_part == Part::P16x16 && best_mvs[0] == skip_mv && skip_ok {
+        if skip_candidate && ci.code.cbp == 0 {
             ci.code.kind = MbKind::PSkip;
             ci.info.t8x8 = false;
             ci.info.mvd = [[[0; 2]; 16]; 2];
@@ -309,6 +358,9 @@ impl<'a, 'b> SliceEnc<'a, 'b> {
             } else if ic.cost < best_cost {
                 return ic;
             }
+        }
+        if !coded_now {
+            self.code_inter(src, &py_, &pu, &pv, qp, &mut ci);
         }
         if f.p.rd && skip_ok && ci.code.cbp != 0 {
             // RD check against P_Skip
