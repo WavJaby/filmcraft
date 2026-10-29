@@ -600,7 +600,14 @@ fn av1_10bit_is_declined_to_software() {
 
 fn av1_software_decline(codec: &str) {
     let ff = filmcraft_testkit::require_ffmpeg!();
-    let path = frame_fixture(&ff, codec, "640x360").expect("required AV1 fixture");
+    let path = match frame_fixture(&ff, codec, "640x360") {
+        Some(path) => path,
+        None if !filmcraft_testkit::ffmpeg_has_encoder(&ff, "libaom-av1") => {
+            filmcraft_testkit::skip("AV1 software decline", "ffmpeg lacks libaom-av1");
+            return;
+        }
+        None => panic!("required AV1 fixture generation failed despite libaom-av1 support"),
+    };
     let s = read_stream(&path);
     let before = filmcraft_codecs::hw::hw_stats();
     assert!(filmcraft_platform::media_foundation_factory(&s.entry).is_none(), "AV1 output intent requires software");

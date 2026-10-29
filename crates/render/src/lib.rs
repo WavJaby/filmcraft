@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use filmcraft_frame::{PixelData, VideoFrame, pool};
 use filmcraft_geom::{Affine, Vec2};
-use filmcraft_media::{FrameRequest, SharedSource};
+use filmcraft_media::{FrameRequest, MediaError, SharedSource};
 use filmcraft_project::{ItemId, ItemKind, ParamValue, Project, Sequence, TrackItem};
 use filmcraft_time::{Tick, TimeDisplay, format_time};
 
@@ -616,7 +616,10 @@ fn media_image(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick, mf:
                 let b = colorman::decode(project, item.item, &f2, n, &seq.settings.color)?;
                 if item.time_interpolation == filmcraft_project::TimeInterpolation::OpticalFlow { flow::interpolate(&img, &b, wgt) } else { img.lerp(&b, wgt) }
             }
-            Err(error) => return Err(error.to_string()),
+            // Optional media failure -> current picture; deferred work and pixel-access failures still propagate.
+            Err(error) if filmcraft_media::pending::is_set() || matches!(error, MediaError::Cancelled | MediaError::FrameAccess(_)) => {
+                return Err(error.to_string());
+            }
             _ => img,
         },
         None => img,
