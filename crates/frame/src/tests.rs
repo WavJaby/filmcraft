@@ -251,6 +251,32 @@ fn materialization_preserves_metadata_and_shared_pixels() {
 }
 
 #[test]
+fn gpu_footprint_tracks_completed_cpu_payload() {
+    let (width, height) = (4u32, 4u32);
+    // Fixture surface: NV12, one luma byte +half a chroma byte per pixel.
+    let gpu_bytes = width as usize * height as usize * 3 / 2;
+    let pixels: Vec<f32> = (0..width * height).flat_map(|_| [0.0, 0.0, 0.0, 1.0]).collect();
+    let cpu_bytes = pixels.len() * std::mem::size_of::<f32>();
+    let surface = Arc::new(TestSurface { downloads: Default::default(), pixels: PixelData::RgbaF32(Arc::new(pixels)) });
+    let frame = VideoFrame {
+        width,
+        height,
+        data: PixelData::Gpu(GpuPixels::new(surface.clone(), Chroma::C420, 8)),
+        color: ColorInfo::REC709,
+        par: (1, 1),
+        pts: Tick::ZERO,
+    };
+    let clone = frame.clone();
+    assert_eq!(frame.byte_size(), gpu_bytes);
+    assert_eq!(surface.downloads.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert!(matches!(clone.cpu().unwrap().data, PixelData::RgbaF32(_)));
+    assert_eq!(surface.downloads.load(std::sync::atomic::Ordering::Relaxed), 1);
+    for copy in [&frame, &clone] {
+        assert_eq!(copy.byte_size(), gpu_bytes + cpu_bytes, "the retained surface and shared CPU payload both consume memory");
+    }
+}
+
+#[test]
 fn nested_gpu_download_is_a_terminal_error() {
     let inner = Arc::new(TestSurface { downloads: Default::default(), pixels: PixelData::Rgba8(Arc::new(vec![0; 4 * 4 * 4])) });
     let outer = Arc::new(TestSurface { downloads: Default::default(), pixels: PixelData::Gpu(GpuPixels::new(inner.clone(), Chroma::C420, 8)) });
