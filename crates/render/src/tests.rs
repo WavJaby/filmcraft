@@ -47,6 +47,100 @@ fn place(p: &mut Project, seq: ItemId, track: usize, item: ItemId, start_f: i64,
     id
 }
 
+fn optional_blend_image(error: Option<filmcraft_media::MediaError>, pending: bool, mode: filmcraft_project::TimeInterpolation) -> Result<Image> {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Source {
+        info: filmcraft_media::MediaInfo,
+        frame: Arc<VideoFrame>,
+        error: Mutex<Option<filmcraft_media::MediaError>>,
+        pending: bool,
+        calls: AtomicUsize,
+    }
+    impl MediaSource for Source {
+        fn info(&self) -> &filmcraft_media::MediaInfo {
+            &self.info
+        }
+        fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
+            assert_eq!(req.time, FrameRate::FPS_24.tick_of(1), "half-speed timeline frame1 needs source frames0+1");
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.pending {
+                filmcraft_media::pending::mark();
+            }
+            match self.error.lock().unwrap().take() {
+                Some(error) => Err(error),
+                None => Ok(self.frame.clone()),
+            }
+        }
+        fn audio(&self, _: i64, _: usize, _: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+            Err(filmcraft_media::MediaError::NoStream("audio"))
+        }
+    }
+    assert!(!filmcraft_media::pending::is_set());
+    let (mut project, red, _, seq, sources) = setup();
+    place(&mut project, seq, 0, red, 0, 48);
+    let sequence = project.sequence(seq).unwrap();
+    let mut item = sequence.video_tracks[0].items[0].clone();
+    item.speed = 0.5;
+    item.time_interpolation = mode;
+    let (width, height) = (2, 2);
+    let pixels = (width * height) as usize;
+    let current = VideoFrame::rgba8(width, height, [255, 0, 0, 255].repeat(pixels));
+    let source = Arc::new(Source {
+        info: sources.0[&red].info().clone(),
+        frame: Arc::new(VideoFrame::rgba8(width, height, [0, 0, 255, 255].repeat(pixels))),
+        error: Mutex::new(error),
+        pending,
+        calls: AtomicUsize::new(0),
+    });
+    let shared = source.clone() as SharedSource;
+    let result = media_image(&project, sequence, &item, FrameRate::FPS_24.tick_of(1), MediaFrame { src: &shared, frame: &current, n: 1 }, 1.0);
+    assert_eq!(source.calls.load(Ordering::Relaxed), 1, "the optional partner fetch must execute");
+    result
+}
+
+#[test]
+fn optional_blend_partner_healthy_control_mixes_both_pictures() {
+    let image = optional_blend_image(None, false, filmcraft_project::TimeInterpolation::FrameBlending).unwrap();
+    // Halfway between opaque linear red and blue: equal channels, unchanged alpha.
+    assert!(image.px.as_chunks::<4>().0.iter().all(|pixel| *pixel == [0.5, 0.0, 0.5, 1.0]));
+}
+
+#[test]
+fn optional_blend_partner_media_errors_keep_the_current_picture() {
+    use filmcraft_media::MediaError;
+    for mode in [filmcraft_project::TimeInterpolation::FrameBlending, filmcraft_project::TimeInterpolation::OpticalFlow] {
+        for error in [
+            MediaError::Decode("partner missing".into()),
+            MediaError::Io("partner I/O".into()),
+            MediaError::Offline("partner offline".into()),
+            MediaError::NoStream("video"),
+            MediaError::Unsupported("partner unsupported".into()),
+        ] {
+            let image = optional_blend_image(Some(error), false, mode).expect("optional media failure must retain the available current picture");
+            assert!(image.px.as_chunks::<4>().0.iter().all(|pixel| *pixel == [1.0, 0.0, 0.0, 1.0]));
+        }
+    }
+}
+
+#[test]
+fn optional_blend_partner_pending_cancelled_and_frame_access_errors_propagate() {
+    use filmcraft_media::MediaError;
+    for (error, pending) in [
+        (MediaError::Decode("partner loading".into()), true),
+        (MediaError::Cancelled, false),
+        (MediaError::FrameAccess("partner CPU readback failed".into()), false),
+    ] {
+        let expected = error.to_string();
+        let actual = optional_blend_image(Some(error), pending, filmcraft_project::TimeInterpolation::FrameBlending);
+        let deferred = filmcraft_media::pending::take();
+        assert_eq!(deferred, pending, "rendering must preserve the retry signal for its caller");
+        assert_eq!(actual.unwrap_err(), expected);
+    }
+}
+
 #[test]
 fn failed_gpu_materialization_aborts_render_and_cpu_plan() {
     use std::sync::atomic::{AtomicUsize, Ordering};
