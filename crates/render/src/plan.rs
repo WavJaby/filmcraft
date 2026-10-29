@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use filmcraft_frame::VideoFrame;
+use filmcraft_frame::{MemoryAccount, MemoryLease, VideoFrame};
 use filmcraft_geom::Affine;
 use filmcraft_media::FrameRequest;
 use filmcraft_project::{ItemId, ItemKind, Project, Sequence, TrackItem};
@@ -161,17 +161,46 @@ impl PlanStack {
 impl FramePlan {
     /// Source storage retained by the plan, before GPU preparation.
     pub fn source_bytes(&self) -> usize {
-        let layers = |ls: &[PlanLayer]| ls.iter().map(|l| l.frame.byte_size()).sum::<usize>();
+        let mut bytes = self.image_bytes();
+        self.visit_sources(|frame| bytes = bytes.saturating_add(frame.byte_size()));
+        bytes
+    }
+
+    /// Charge every retained source reference, including future materialization, for one cache entry.
+    pub fn memory_charge(&self, account: &MemoryAccount) -> MemoryLease {
+        let mut charge = account.charge(self.image_bytes());
+        self.visit_sources(|frame| charge.extend(frame.memory_charge(account)));
+        charge
+    }
+
+    fn image_bytes(&self) -> usize {
         match self {
-            Self::Image(img) => img.px.len() * size_of::<f32>(),
+            Self::Image(image) => image.px.len().saturating_mul(size_of::<f32>()),
+            _ => 0,
+        }
+    }
+
+    fn visit_sources(&self, mut visit: impl FnMut(&VideoFrame)) {
+        let mut layers = |ls: &[PlanLayer]| {
+            for layer in ls {
+                visit(&layer.frame);
+            }
+        };
+        match self {
+            Self::Image(_) => (),
             Self::Layers { layers: ls, .. } => layers(ls),
-            Self::Composite { steps, .. } => steps
-                .iter()
-                .map(|s| match s {
-                    PlanStep::Layers(ls) => layers(ls),
-                    PlanStep::Transition { inputs, .. } => inputs.iter().map(|ls| layers(ls)).sum(),
-                })
-                .sum(),
+            Self::Composite { steps, .. } => {
+                for step in steps {
+                    match step {
+                        PlanStep::Layers(ls) => layers(ls),
+                        PlanStep::Transition { inputs, .. } => {
+                            for input in inputs {
+                                layers(input);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -618,6 +647,40 @@ fn execute_layers(canvas: &mut crate::Image, layers: &[PlanLayer]) -> crate::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composite_charges_both_transition_inputs_and_each_retained_reference() {
+        let frame = Arc::new(VideoFrame::rgba8(2, 2, vec![0; 2 * 2 * 4]));
+        let layer = PlanLayer::new(frame, Affine::IDENTITY, 1.0, Blend::Normal);
+        let plan = FramePlan::Composite {
+            width: 2,
+            height: 2,
+            steps: vec![
+                PlanStep::Layers(vec![layer.clone()]),
+                PlanStep::Transition {
+                    inputs: [vec![layer.clone(), layer.clone()], vec![layer]],
+                    effect: filmcraft_project::find_effect("push").unwrap().instance(),
+                    progress: 0.0,
+                    scale: 1.0,
+                },
+            ],
+        };
+        // One ordinary layer +two left inputs +one right input, each a 2x2 RGBA8 reference.
+        let expected = (1 + 2 + 1) * (2 * 2 * 4);
+        let account = MemoryAccount::default();
+        let charge = plan.memory_charge(&account);
+        assert_eq!(plan.source_bytes(), expected);
+        assert_eq!(account.bytes(), expected);
+        drop(plan);
+        assert_eq!(account.bytes(), expected);
+        drop(charge);
+        assert_eq!(account.bytes(), 0);
+        let image = FramePlan::Image(crate::Image::new(2, 2));
+        let charge = image.memory_charge(&account);
+        assert_eq!(account.bytes(), 2 * 2 * 4 * size_of::<f32>());
+        drop(charge);
+        assert_eq!(account.bytes(), 0);
+    }
 
     #[test]
     fn flattening_an_operation_preserves_its_picture() {

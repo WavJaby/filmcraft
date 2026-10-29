@@ -7,7 +7,10 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
+mod memory;
 pub mod pool;
+
+pub use memory::{MemoryAccount, MemoryLease};
 
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
@@ -69,7 +72,12 @@ pub struct GpuPixels {
     pub chroma: Chroma,
     /// Significant bits per sample (8 = NV12-like, 10 = P010-like).
     pub bits: u32,
-    cpu: Arc<OnceLock<Result<PixelData, String>>>,
+    cpu: Arc<CpuState>,
+}
+
+struct CpuState {
+    result: OnceLock<Result<PixelData, String>>,
+    footprint: memory::Footprint,
 }
 
 impl std::fmt::Debug for GpuPixels {
@@ -80,7 +88,8 @@ impl std::fmt::Debug for GpuPixels {
 
 impl GpuPixels {
     pub fn new(surface: Arc<dyn GpuSurface>, chroma: Chroma, bits: u32) -> Self {
-        Self { surface, chroma, bits, cpu: Arc::new(OnceLock::new()) }
+        let cpu = Arc::new(CpuState { result: OnceLock::new(), footprint: memory::Footprint::new(surface.byte_len()) });
+        Self { surface, chroma, bits, cpu }
     }
 
     pub fn surface(&self) -> &Arc<dyn GpuSurface> {
@@ -90,11 +99,13 @@ impl GpuPixels {
     /// Download once; clones share successful pixels or a terminal error.
     pub fn cpu(&self) -> Result<&PixelData, String> {
         self.cpu
+            .result
             .get_or_init(|| {
                 let data = self.surface.download()?;
                 if matches!(data, PixelData::Gpu(_)) {
                     return Err("GPU download returned another GPU surface".into());
                 }
+                self.cpu.footprint.add_cpu(data.byte_size());
                 Ok(data)
             })
             .as_ref()
@@ -115,6 +126,20 @@ pub enum PixelData {
     /// A planar Y'CbCr picture in GPU memory (see [`GpuSurface`]); CPU code uses
     /// [`VideoFrame::cpu`].
     Gpu(GpuPixels),
+}
+
+impl PixelData {
+    fn byte_size(&self) -> usize {
+        match self {
+            Self::Gpu(g) => g.cpu.footprint.bytes(),
+            Self::Rgba8(data) => data.len(),
+            Self::RgbaF32(data) => data.len().saturating_mul(size_of::<f32>()),
+            Self::Yuv8 { planes, alpha, .. } => planes.iter().chain(alpha).fold(0usize, |bytes, plane| bytes.saturating_add(plane.len())),
+            Self::Yuv16 { planes, alpha, .. } => {
+                planes.iter().chain(alpha).fold(0usize, |bytes, plane| bytes.saturating_add(plane.len().saturating_mul(size_of::<u16>())))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -200,12 +225,14 @@ impl VideoFrame {
 
     /// Approximate memory footprint in bytes (for caches).
     pub fn byte_size(&self) -> usize {
+        self.data.byte_size()
+    }
+
+    /// Charge this cache reference until its entry is dropped; GPU charges follow CPU completion.
+    pub fn memory_charge(&self, account: &MemoryAccount) -> MemoryLease {
         match &self.data {
-            PixelData::Gpu(g) => g.surface().byte_len(),
-            PixelData::Rgba8(d) => d.len(),
-            PixelData::RgbaF32(d) => d.len() * 4,
-            PixelData::Yuv8 { planes, alpha, .. } => planes.iter().map(|p| p.len()).sum::<usize>() + alpha.as_ref().map_or(0, |a| a.len()),
-            PixelData::Yuv16 { planes, alpha, .. } => (planes.iter().map(|p| p.len()).sum::<usize>() + alpha.as_ref().map_or(0, |a| a.len())) * 2,
+            PixelData::Gpu(g) => g.cpu.footprint.charge(account),
+            _ => account.charge(self.byte_size()),
         }
     }
 
