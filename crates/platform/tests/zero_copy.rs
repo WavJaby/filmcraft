@@ -93,14 +93,22 @@ fn gpu_pictures_composite_like_uploaded_ones_and_read_back_exactly() {
         assert_eq!(zero.len(), soft.len(), "{name}: picture count");
         for (z, c) in zero.iter().zip(&soft) {
             assert_eq!(z.pts, c.pts, "{name}: order");
+            // A cloned cache entry spans hardware readback; the original picture survives removal.
+            let cache: filmcraft_media::cache::FrameCache<i64> = filmcraft_media::cache::FrameCache::new(usize::MAX);
+            cache.insert(z.pts, Arc::new(z.frame.clone()));
+            let gpu_bytes = cache.stats().1;
             // CPU consumers: the downloaded planes are the software decoder's exactly
             let down = z.frame.cpu().unwrap();
+            assert!(cache.stats().1 > gpu_bytes, "{name}: hardware readback must charge the live cache entry");
+            cache.clear();
+            assert_eq!((cache.stats().0, cache.stats().1), (0, 0), "{name}: removing the entry releases its charge");
             assert_same(
                 &format!("{name} pts {}", z.pts),
                 &[filmcraft_codecs::DecodedFrame { pts: z.pts, frame: down.into_owned(), draft: false }],
                 std::slice::from_ref(c),
             );
         }
+        eprintln!("Resident cache readback charges: {name}, verified {} frames, released to zero", zero.len());
         // the compositor: sampled from the decoder's memory vs uploaded from CPU planes
         let uploads = compositor.uploaded_bytes;
         for (z, c) in zero.iter().zip(&soft).take(6) {

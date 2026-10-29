@@ -12,7 +12,6 @@ use std::{
 use wasm_bindgen::{JsCast, JsValue};
 
 thread_local! {
-    static ENABLED: Cell<bool> = const { Cell::new(false) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     static OWNERS: RefCell<HashMap<u64, Rc<Owner>>> = RefCell::new(HashMap::new());
     static RETAINED: Cell<u64> = const { Cell::new(0) };
@@ -96,7 +95,7 @@ impl GpuSurface for Surface {
 
 pub(super) fn enable() {
     filmcraft_gpu::set_surface_importer(import);
-    ENABLED.with(|enabled| enabled.set(true));
+    filmcraft_codecs::hw::set_gpu_frames(true);
 }
 
 fn dimension(value: JsValue) -> Option<u32> {
@@ -115,13 +114,13 @@ pub(super) fn retain(frame: &JsValue, config: &Config) -> Option<VideoFrame> {
 }
 
 pub(super) fn stats() -> serde_json::Value {
-    serde_json::json!({"enabled":ENABLED.with(Cell::get), "live":LIVE.with(Cell::get),
+    serde_json::json!({"enabled":filmcraft_codecs::hw::gpu_frames(), "live":LIVE.with(Cell::get),
         "retained":RETAINED.with(Cell::get), "rejected":REJECTED.with(Cell::get), "closed":CLOSED.with(Cell::get),
         "cpuMaterializations":MATERIALIZED.with(Cell::get), "canvas":CANVAS.with(Cell::get), "failed":FAILED.with(Cell::get), "imports":IMPORTED.with(Cell::get)})
 }
 
 fn retain_inner(frame: &JsValue, config: &Config) -> Option<VideoFrame> {
-    if !ENABLED.with(Cell::get) || config.rotation != 0 {
+    if !filmcraft_codecs::hw::gpu_frames() || config.rotation != 0 {
         return None;
     }
     if !matches!(get(frame, "format").as_string().as_deref(), Some("NV12" | "I420")) {

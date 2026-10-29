@@ -6,6 +6,7 @@ use crate::PixelData;
 
 #[derive(Default)]
 pub(crate) struct CpuState {
+    pub(crate) footprint: crate::memory::Footprint,
     result: OnceLock<Result<PixelData, String>>,
     started: Mutex<bool>,
     done: Condvar,
@@ -32,7 +33,12 @@ impl CpuTransfer {
             pixels => Ok(pixels),
         });
         let _guard = self.0.started.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = self.0.result.set(result);
+        if self.0.result.get().is_none() {
+            if let Ok(pixels) = &result {
+                self.0.footprint.add_cpu(pixels.byte_size());
+            }
+            let _ = self.0.result.set(result);
+        }
         self.0.done.notify_all();
     }
 }
@@ -46,6 +52,10 @@ impl Drop for CpuTransfer {
 }
 
 impl CpuState {
+    pub(crate) fn new(gpu_bytes: usize) -> Self {
+        Self { footprint: crate::memory::Footprint::new(gpu_bytes), ..Self::default() }
+    }
+
     pub(crate) fn start(self: &Arc<Self>) -> Option<CpuTransfer> {
         let mut started = self.started.lock().unwrap_or_else(|e| e.into_inner());
         if *started {
@@ -92,6 +102,44 @@ mod tests {
         drop(state.start().unwrap());
         assert!(matches!(state.readiness(), CpuReadiness::Failed("CPU transfer abandoned")));
         assert!(state.start().is_none());
+    }
+
+    #[test]
+    fn failed_and_abandoned_transfers_do_not_charge_cpu_payload() {
+        let gpu_bytes = 2 * 2 * 4; // Fixture2x2 RGBA8 surface.
+        for abandon in [false, true] {
+            let state = Arc::new(CpuState::new(gpu_bytes));
+            let account = crate::MemoryAccount::default();
+            let charge = state.footprint.charge(&account);
+            let transfer = state.start().unwrap();
+            if abandon {
+                drop(transfer);
+            } else {
+                transfer.complete(Err("injected readback failure".into()));
+            }
+            assert!(matches!(state.readiness(), CpuReadiness::Failed(_)));
+            assert_eq!(account.bytes(), gpu_bytes, "failed extraction retains only the fixture GPU surface");
+            drop(charge);
+            assert_eq!(account.bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn delayed_success_updates_charges_before_ready_is_published() {
+        let gpu_bytes = 2 * 2 * 4;
+        let payload = vec![0.0; 2 * 2 * 4];
+        let cpu_bytes = payload.len() * size_of::<f32>();
+        let state = Arc::new(CpuState::new(gpu_bytes));
+        let account = crate::MemoryAccount::default();
+        let charge = state.footprint.charge(&account);
+        let transfer = state.start().unwrap();
+        assert!(matches!(state.readiness(), CpuReadiness::Pending));
+        assert_eq!(account.bytes(), gpu_bytes);
+        transfer.complete(Ok(PixelData::RgbaF32(Arc::new(payload))));
+        assert!(matches!(state.readiness(), CpuReadiness::Ready(_)));
+        assert_eq!(account.bytes(), gpu_bytes + cpu_bytes);
+        drop(charge);
+        assert_eq!(account.bytes(), 0);
     }
 
     #[test]

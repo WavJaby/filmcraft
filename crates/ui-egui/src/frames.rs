@@ -331,10 +331,10 @@ pub struct GpuPlan {
 }
 
 impl GpuPlan {
-    /// Bytes this plan keeps alive (layer frames + converted texels).
-    fn bytes(&self) -> usize {
-        let frames = self.plan.source_bytes();
-        frames + self.prepared.bytes()
+    fn memory_charge(&self, account: &filmcraft_frame::MemoryAccount) -> filmcraft_frame::MemoryLease {
+        let mut charge = self.plan.memory_charge(account);
+        charge.extend(account.charge(self.prepared.bytes()));
+        charge
     }
 }
 
@@ -383,9 +383,9 @@ impl<T> Cached<T> {
 /// Finished plans, bounded by count and bytes (oldest use evicted first).
 #[derive(Default)]
 struct PlanCache {
-    map: HashMap<FrameKey, (Cached<GpuPlan>, u64, usize)>,
+    map: HashMap<FrameKey, (Cached<GpuPlan>, u64, filmcraft_frame::MemoryLease)>,
     clock: u64,
-    bytes: usize,
+    bytes: filmcraft_frame::MemoryAccount,
 }
 
 impl PlanCache {
@@ -403,20 +403,19 @@ impl PlanCache {
 
     fn insert(&mut self, k: FrameKey, p: Cached<GpuPlan>) {
         self.clock += 1;
-        let b = p.bytes(GpuPlan::bytes);
-        self.bytes += b;
-        if let Some((_, _, old)) = self.map.insert(k, (p, self.clock, b)) {
-            self.bytes -= old;
-        }
-        if self.map.len() > Self::MAX || self.bytes > Self::BUDGET {
-            let mut v: Vec<(u64, FrameKey, usize)> = self.map.iter().map(|(k, v)| (v.1, *k, v.2)).collect();
+        let charge = match &p.value {
+            Ok(plan) => plan.memory_charge(&self.bytes),
+            Err(error) => self.bytes.charge(error.len()),
+        };
+        self.map.insert(k, (p, self.clock, charge));
+        if self.map.len() > Self::MAX || self.bytes.bytes() > Self::BUDGET {
+            let mut v: Vec<(u64, FrameKey)> = self.map.iter().map(|(k, v)| (v.1, *k)).collect();
             v.sort_unstable_by_key(|x| x.0);
-            for (_, k, b) in v {
-                if self.map.len() <= Self::MAX && self.bytes <= Self::BUDGET {
+            for (_, k) in v {
+                if self.map.len() <= Self::MAX && self.bytes.bytes() <= Self::BUDGET {
                     break;
                 }
                 self.map.remove(&k);
-                self.bytes -= b;
             }
         }
     }
@@ -586,7 +585,7 @@ impl FrameServer {
             (c.map.len(), c.bytes)
         };
         let p = self.shared.plans.lock().unwrap_or_else(PoisonError::into_inner);
-        (n, b, p.map.len(), p.bytes)
+        (n, b, p.map.len(), p.bytes.bytes())
     }
 
     pub fn get(&self, k: &FrameKey) -> Option<Arc<Rgba>> {
@@ -1169,6 +1168,51 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
 mod tests {
     use super::{PlaybackMeter, Target, background_work, playback_plan};
     use filmcraft_project::ItemId;
+
+    #[test]
+    fn plan_cache_charge_tracks_late_cpu_payload_and_error_replacement() {
+        use super::*;
+        use filmcraft_frame::{Chroma, CpuTransfer, GpuFormat, GpuPixels, GpuSurface, PixelData, VideoFrame};
+        #[derive(Debug)]
+        struct Surface;
+        impl GpuSurface for Surface {
+            fn size(&self) -> (u32, u32) {
+                (2, 2)
+            }
+            fn byte_len(&self) -> usize {
+                2 * 2 * 4
+            }
+            fn id(&self) -> u64 {
+                1
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn prepare_cpu(&self, transfer: CpuTransfer) {
+                transfer.complete(Ok(PixelData::RgbaF32(Arc::new(vec![0.0; 2 * 2 * 4]))));
+            }
+        }
+        let gpu_bytes = 2 * 2 * 4;
+        let cpu_bytes = 2 * 2 * 4 * size_of::<f32>();
+        let frame = Arc::new(VideoFrame {
+            data: PixelData::Gpu(GpuPixels::new(Arc::new(Surface), GpuFormat::Yuv { chroma: Chroma::C420, bits: 8 })),
+            ..VideoFrame::rgba8(2, 2, vec![0; gpu_bytes])
+        });
+        let layer = filmcraft_render::plan::PlanLayer::new(frame.clone(), Default::default(), 1.0, filmcraft_render::Blend::Normal);
+        let plan = GpuPlan { plan: filmcraft_render::plan::FramePlan::Layers { width: 2, height: 2, layers: vec![layer] }, prepared: Default::default() };
+        let key = FrameKey { target: Target::Item(ItemId(1)), frame: 0, size: 2, revision: 0, draft: false };
+        let mut cache = PlanCache::default();
+        cache.insert(key, Cached::new(Ok(plan)));
+        assert_eq!(cache.bytes.bytes(), gpu_bytes);
+        frame.cpu().unwrap();
+        assert_eq!(cache.bytes.bytes(), gpu_bytes + cpu_bytes);
+        let error = "injected plan failure".to_owned();
+        cache.insert(key, Cached::new(Err(error.clone())));
+        assert_eq!(cache.bytes.bytes(), error.len());
+        cache.map.clear();
+        assert_eq!(cache.bytes.bytes(), 0);
+        assert!(frame.cpu().is_ok());
+    }
 
     #[test]
     fn pending_error_success_and_cancellation_have_distinct_outcomes() {

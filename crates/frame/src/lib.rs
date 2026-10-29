@@ -8,9 +8,12 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable))]
 
 mod cpu;
+mod memory;
 pub mod pending;
 pub mod pool;
 pub use cpu::{CpuReadiness, CpuTransfer};
+
+pub use memory::{MemoryAccount, MemoryLease};
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -88,7 +91,8 @@ impl std::fmt::Debug for GpuPixels {
 
 impl GpuPixels {
     pub fn new(surface: Arc<dyn GpuSurface>, format: GpuFormat) -> Self {
-        Self { surface, format, cpu: Arc::default() }
+        let cpu = Arc::new(cpu::CpuState::new(surface.byte_len()));
+        Self { surface, format, cpu }
     }
 
     pub fn surface(&self) -> &Arc<dyn GpuSurface> {
@@ -138,6 +142,20 @@ pub enum PixelData {
     /// A YUV/RGB picture in GPU memory (see [`GpuSurface`]); CPU code uses
     /// [`VideoFrame::cpu`].
     Gpu(GpuPixels),
+}
+
+impl PixelData {
+    fn byte_size(&self) -> usize {
+        match self {
+            Self::Gpu(g) => g.cpu.footprint.bytes(),
+            Self::Rgba8(data) => data.len(),
+            Self::RgbaF32(data) => data.len().saturating_mul(size_of::<f32>()),
+            Self::Yuv8 { planes, alpha, .. } => planes.iter().chain(alpha).fold(0usize, |bytes, plane| bytes.saturating_add(plane.len())),
+            Self::Yuv16 { planes, alpha, .. } => {
+                planes.iter().chain(alpha).fold(0usize, |bytes, plane| bytes.saturating_add(plane.len().saturating_mul(size_of::<u16>())))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -226,12 +244,14 @@ impl VideoFrame {
 
     /// Approximate memory footprint in bytes (for caches).
     pub fn byte_size(&self) -> usize {
+        self.data.byte_size()
+    }
+
+    /// Charge this cache reference until its entry is dropped; GPU charges follow CPU completion.
+    pub fn memory_charge(&self, account: &MemoryAccount) -> MemoryLease {
         match &self.data {
-            PixelData::Gpu(g) => g.surface().byte_len(),
-            PixelData::Rgba8(d) => d.len(),
-            PixelData::RgbaF32(d) => d.len() * 4,
-            PixelData::Yuv8 { planes, alpha, .. } => planes.iter().map(|p| p.len()).sum::<usize>() + alpha.as_ref().map_or(0, |a| a.len()),
-            PixelData::Yuv16 { planes, alpha, .. } => (planes.iter().map(|p| p.len()).sum::<usize>() + alpha.as_ref().map_or(0, |a| a.len())) * 2,
+            PixelData::Gpu(g) => g.cpu.footprint.charge(account),
+            _ => account.charge(self.byte_size()),
         }
     }
 
