@@ -178,8 +178,12 @@ fn check(what: &str, specs: &[Spec], scale: f32) {
         // twice: the second render starts from recycled buffers
         for round in 0..2 {
             let got = render_sequence(&p, seq, t, opts, &map).unwrap();
-            same_bits(&got, &reference(&p, seq, t, opts, &map), &format!("{what} (frame {f}, render {round})"));
+            let want = reference(&p, seq, t, opts, &map);
+            same_bits(&got, &want, &format!("{what} (frame {f}, render {round})"));
             pool::recycle_f32(got.px);
+            // and as the monitor's bytes, straight from the frame where it is one picture alone
+            let bytes = render_sequence_rgba8(&p, seq, t, opts, &map).unwrap();
+            assert!(bytes == (want.w, want.h, want.over_black_with_alpha_rgba8()), "{what} (frame {f}, render {round}): monitor bytes");
         }
     }
 }
@@ -218,6 +222,8 @@ fn shortcuts_give_the_general_paths_bits() {
     check("bigger banner", &[cam(), Spec::new(banner(W * 2, H * 2, (0, H * 2 - 18, W * 2, H * 2)))], 1.0);
     // reduced-resolution rendering decimates every frame
     check("half scale", &[cam(), ban(bar)], 0.5);
+    check("camera alone at half scale", &[cam()], 0.5);
+    check("camera alone at a third", &[cam()], 1.0 / 3.0);
     check("quarter scale", &[cam(), ban(corner)], 0.25);
 }
 
@@ -229,8 +235,15 @@ fn which_layers_take_a_shortcut() {
     let layer = |track: usize, allow: bool| {
         item_layer_ex(&p, s, s.video_tracks[track].item_at(t).expect("clip"), t, opts, &map, LayerWant { tc: "", allow_region: allow }).unwrap()
     };
-    // a camera frame has no alpha: opaque, the whole picture
-    assert!(matches!(layer(0, true), Some(Layer::Full { opaque: true, .. })));
+    // a camera frame has no alpha: opaque, the whole picture, converted when it is needed
+    assert!(matches!(layer(0, true), Some(Layer::Frame { .. })));
+    // alone, it stays that frame up to the monitor's bytes; under a banner it is converted
+    let canvas = |specs: &[Spec]| {
+        let (p, seq, map) = scene(specs);
+        seq_canvas(&p, p.sequence(seq).expect("sequence"), t, opts, &map, None).unwrap().frame.is_some()
+    };
+    assert!(canvas(&[Spec::new(camera(W, H))]));
+    assert!(!canvas(&[Spec::new(camera(W, H)), Spec::new(banner(W, H, (0, H - 9, W, H)))]));
     // a banner is only its rectangle (rows H-9.. of a 96-wide picture)
     match layer(1, true) {
         Some(Layer::Region { image, x, y, .. }) => assert_eq!((x, y, image.w, image.h), (0, H - 9, W, 9)),
@@ -291,14 +304,14 @@ fn a_rectangle_mixes_like_the_padded_layer_in_every_blend_mode() {
 #[test]
 fn a_region_layer_expands_to_the_whole_layer() {
     let image = Image { w: 3, h: 2, px: (0..24).map(|i| i as f32 + 1.0).collect() };
-    let (full, op, bl) = Layer::Region { image, x: 2, y: 1, opacity: 0.5, blend: Blend::Multiply }.into_full(6, 4);
+    let (full, op, bl) = Layer::Region { image, x: 2, y: 1, opacity: 0.5, blend: Blend::Multiply }.into_full(6, 4).unwrap();
     assert_eq!((full.w, full.h, op, bl), (6, 4, 0.5, Blend::Multiply));
     assert_eq!(&full.px[((6 + 2) * 4)..((6 + 5) * 4)], &(1..=12).map(|i| i as f32).collect::<Vec<_>>()[..]);
     assert_eq!(&full.px[((2 * 6 + 2) * 4)..((2 * 6 + 5) * 4)], &(13..=24).map(|i| i as f32).collect::<Vec<_>>()[..]);
     assert_eq!(full.px.iter().filter(|v| **v != 0.0).count(), 24);
     // a region that sticks out is cut, not a panic
     let sticks = Image { w: 4, h: 3, px: vec![1.0; 48] };
-    let (full, ..) = Layer::Region { image: sticks, x: 4, y: 2, opacity: 1.0, blend: Blend::Normal }.into_full(6, 4);
+    let (full, ..) = Layer::Region { image: sticks, x: 4, y: 2, opacity: 1.0, blend: Blend::Normal }.into_full(6, 4).unwrap();
     assert_eq!(full.px.len(), 6 * 4 * 4);
     // only the two columns and two rows inside the output are copied, none wrapped into the next row
     assert_eq!(full.px.iter().filter(|v| **v == 1.0).count(), 2 * 2 * 4);

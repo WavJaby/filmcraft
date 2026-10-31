@@ -111,7 +111,7 @@ impl ExportRenderer {
                 if wgpu::Instance::enabled_backend_features().is_empty() {
                     return None;
                 }
-                let instance = wgpu::Instance::default();
+                let instance = crate::adapter::native_instance();
                 let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
                 #[cfg(test)]
                 eprintln!("GPU export test adapter: {:?}", adapter.get_info());
