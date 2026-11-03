@@ -5,6 +5,9 @@ use filmcraft_project::{ItemKind, Label, MediaClip, MediaRef, SequenceSettings, 
 use filmcraft_render::SourceMap;
 use filmcraft_time::TICKS_PER_SECOND;
 
+// Serialize GPU-hook registry changes + counters across hook/pipeline tests.
+pub(crate) static GPU_HOOK_LOCK: Mutex<()> = Mutex::new(());
+
 pub(crate) fn project() -> (Arc<Project>, ItemId, SourceMap) {
     let mut p = Project::new("x");
     let g = GeneratorSource::new(Generator::ColorMatte { color: [1.0, 0.0, 0.0, 1.0] }, 320, 180, FrameRate::FPS_24, Tick(2 * TICKS_PER_SECOND));
@@ -360,6 +363,7 @@ fn hdr_exports_signal_pq_and_hlg() {
 /// process-global and parallel tests would see each other's factories.
 #[test]
 fn gpu_hook_scenarios() {
+    let _guard = GPU_HOOK_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     // 1. Declining renderer: byte-equal to Off, and an empty registry too.
     crate::reset_frame_renderers_for_tests();
     crate::register_frame_renderer(|| None);

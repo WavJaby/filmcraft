@@ -68,6 +68,8 @@ struct RendererPool {
     capacity: usize,
     renderers: std::sync::Mutex<Vec<Box<dyn FrameRenderer>>>,
     available: std::sync::Condvar,
+    /// All renderers can draw a plan prepared before acquiring the pool.
+    supports_prepared_plan: bool,
     /// A renderer panicked: the pool is retired and the rest of the export renders on the CPU.
     failed: std::sync::atomic::AtomicBool,
 }
@@ -75,10 +77,12 @@ struct RendererPool {
 impl RendererPool {
     /// `None` for an empty list (a pool nobody could take from).
     fn new(renderers: Vec<Box<dyn FrameRenderer>>) -> Option<Self> {
+        let supports_prepared_plan = !renderers.is_empty() && renderers.iter().all(|r| r.supports_prepared_plan());
         (!renderers.is_empty()).then(|| Self {
             capacity: renderers.len(),
             renderers: std::sync::Mutex::new(renderers),
             available: std::sync::Condvar::new(),
+            supports_prepared_plan,
             failed: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -248,12 +252,37 @@ impl Pipeline {
         let t = self.rate.tick_of(f);
         // CPU whole-frame plans bypass the GPU pool; unsupported GPU work falls back, terminal errors propagate.
         let pool = self.renderer.as_ref().filter(|_| !filmcraft_render::plan::is_cpu_frame(&self.project, self.seq, t));
+        let plan = if pool.is_some_and(|pool| pool.supports_prepared_plan) {
+            Some(filmcraft_render::plan::plan_frame(&self.project, self.seq, t, self.opts, sources).map_err(ExportError::Encode)?)
+        } else {
+            None
+        };
+        let img = self.render_image(pool, plan.as_ref(), t, sources)?;
+        self.finish_frame(img, t)
+    }
+
+    fn render_image(
+        &self,
+        pool: Option<&RendererPool>,
+        plan: Option<&filmcraft_render::plan::FramePlan>,
+        t: filmcraft_time::Tick,
+        sources: &dyn SourceProvider,
+    ) -> Result<Image> {
+        use filmcraft_render::plan::FramePlan;
+        if let Some(FramePlan::Image(img)) = plan {
+            note_gpu_fallback();
+            return Ok(img.clone());
+        }
+        let pool = pool.filter(|_| !matches!(plan, Some(FramePlan::Composite { .. })));
         let gpu = match pool {
             Some(pool) => {
                 let asked = web_time::Instant::now();
                 pool.with(|r| {
                     crate::note_lock_wait(asked.elapsed());
-                    r.render(&self.project, self.seq, t, self.opts, sources)
+                    match plan {
+                        Some(plan) => r.render_prepared(plan),
+                        None => r.render(&self.project, self.seq, t, self.opts, sources),
+                    }
                 })
                 .transpose()
                 .map_err(ExportError::Encode)?
@@ -261,18 +290,21 @@ impl Pipeline {
             }
             None => None,
         };
-        let img = match gpu {
+        match gpu {
             Some(img) => {
                 note_gpu_frame();
-                img
+                Ok(img)
             }
             None => {
                 if self.renderer.is_some() {
                     note_gpu_fallback();
                 }
-                filmcraft_render::render_sequence(&self.project, self.seq, t, self.opts, sources).map_err(ExportError::Encode)?
+                filmcraft_render::render_sequence(&self.project, self.seq, t, self.opts, sources).map_err(ExportError::Encode)
             }
-        };
+        }
+    }
+
+    fn finish_frame(&self, img: Image, t: filmcraft_time::Tick) -> Result<(Vec<u8>, Vec<f32>)> {
         let mut img = self.place(img);
         self.overlays(&mut img, t);
         let lim = &self.effects.video_limiter;
@@ -531,6 +563,121 @@ fn limit_px(c: &mut [f32; 3], lo: f32, hi: f32) {
 mod failure_tests {
     use super::*;
     use filmcraft_media::{FrameRequest, MediaError, MediaInfo, MediaSource};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PreparedSpy {
+        supported: bool,
+        calls: Arc<[AtomicUsize; 2]>,
+        fail: bool,
+    }
+
+    impl FrameRenderer for PreparedSpy {
+        fn supports_prepared_plan(&self) -> bool {
+            self.supported
+        }
+
+        fn render_prepared(&mut self, _: &filmcraft_render::plan::FramePlan) -> std::result::Result<Option<Image>, String> {
+            self.calls[1].fetch_add(1, Ordering::Relaxed);
+            if self.fail { Err("injected prepared failure".into()) } else { Ok(None) }
+        }
+
+        fn render(
+            &mut self,
+            _: &Project,
+            _: ItemId,
+            _: filmcraft_time::Tick,
+            _: RenderOptions,
+            _: &dyn SourceProvider,
+        ) -> std::result::Result<Option<Image>, String> {
+            self.calls[0].fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+
+    fn prepared_pipeline(capabilities: &[bool], fail: bool) -> (Pipeline, filmcraft_render::SourceMap, Arc<[AtomicUsize; 2]>) {
+        let (project, seq, sources) = crate::tests::project();
+        let mut pipeline = Pipeline::new(project, seq, &ExportSettings { gpu_rendering: GpuRendering::Off, ..Default::default() }, false).unwrap();
+        let calls = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        pipeline.renderer = RendererPool::new(
+            capabilities.iter().map(|&supported| Box::new(PreparedSpy { supported, calls: calls.clone(), fail }) as Box<dyn FrameRenderer>).collect(),
+        );
+        (pipeline, sources, calls)
+    }
+
+    #[test]
+    fn prepared_dispatch_plans_before_borrowing_and_mixed_pool_uses_legacy() {
+        let _guard = crate::tests::GPU_HOOK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (pipeline, sources, calls) = prepared_pipeline(&[true, true], false);
+        let pool = pipeline.renderer.as_ref().unwrap();
+        assert!(pool.supports_prepared_plan);
+        let lookups = AtomicUsize::new(0);
+        let probe = |item| {
+            let free = pool.renderers.try_lock().expect("planning must not hold the pool mutex");
+            assert_eq!(free.len(), pool.capacity, "planning must not retain a renderer");
+            lookups.fetch_add(1, Ordering::Relaxed);
+            sources.source(item)
+        };
+        pipeline.frame(0, &probe).unwrap();
+        assert!(lookups.load(Ordering::Relaxed) > 0, "source probe must respond");
+        assert_eq!(calls[1].load(Ordering::Relaxed), 1);
+        assert_eq!(calls[0].load(Ordering::Relaxed), 0);
+
+        let (mixed, sources, calls) = prepared_pipeline(&[true, false], false);
+        assert!(!mixed.renderer.as_ref().unwrap().supports_prepared_plan);
+        mixed.frame(0, &sources).unwrap();
+        assert_eq!(calls[0].load(Ordering::Relaxed), 1);
+        assert_eq!(calls[1].load(Ordering::Relaxed), 0);
+        assert!(RendererPool::new(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn prepared_image_bypasses_retired_pool_and_composite_uses_cpu() {
+        use filmcraft_render::plan::FramePlan;
+        let _guard = crate::tests::GPU_HOOK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (pipeline, sources, calls) = prepared_pipeline(&[true], false);
+        let pool = pipeline.renderer.as_ref().unwrap();
+        pool.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut image = Image::new(1, 1);
+        image.px.copy_from_slice(&[1.0, 0.0, 0.0, 1.0]);
+        let before = crate::gpu_render_stats();
+        let got = pipeline.render_image(Some(pool), Some(&FramePlan::Image(image.clone())), filmcraft_time::Tick::ZERO, &sources).unwrap();
+        assert_eq!((got.w, got.h, got.px), (image.w, image.h, image.px));
+        let after = crate::gpu_render_stats();
+        assert_eq!(after.frames, before.frames, "completed CPU Image is not GPU work");
+        assert_eq!(after.fallbacks, before.fallbacks + 1, "one completed CPU Image counts one fallback");
+        pool.failed.store(false, std::sync::atomic::Ordering::SeqCst);
+        let plan = FramePlan::Composite { width: pipeline.w as usize, height: pipeline.h as usize, steps: Vec::new() };
+        let got = pipeline.render_image(Some(pool), Some(&plan), filmcraft_time::Tick::ZERO, &sources).unwrap();
+        let reference = filmcraft_render::render_sequence(&pipeline.project, pipeline.seq, filmcraft_time::Tick::ZERO, pipeline.opts, &sources).unwrap();
+        assert_eq!(got.px, reference.px);
+        let after_composite = crate::gpu_render_stats();
+        assert_eq!(after_composite.frames, before.frames);
+        assert_eq!(after_composite.fallbacks, after.fallbacks + 1, "one Composite counts one fallback");
+        assert_eq!(calls[0].load(Ordering::Relaxed), 0);
+        assert_eq!(calls[1].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn prepared_terminal_error_is_not_cpu_fallback() {
+        let _guard = crate::tests::GPU_HOOK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (pipeline, sources, calls) = prepared_pipeline(&[true], true);
+        assert!(pipeline.frame(0, &sources).unwrap_err().to_string().contains("injected prepared failure"));
+        assert_eq!(calls[1].load(Ordering::Relaxed), 1);
+        assert_eq!(calls[0].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn prepared_planning_error_precedes_renderer_acquisition() {
+        let _guard = crate::tests::GPU_HOOK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (pipeline, mut sources, calls) = prepared_pipeline(&[true], false);
+        let video = pipeline.project.sequence(pipeline.seq).unwrap().video_tracks[0].items[0].item;
+        let info = sources.0[&video].info().clone();
+        sources.0.insert(video, Arc::new(FailedSource(info)));
+        assert!(pipeline.frame(0, &sources).unwrap_err().to_string().contains("injected export frame failure"));
+        assert_eq!(calls[0].load(Ordering::Relaxed), 0);
+        assert_eq!(calls[1].load(Ordering::Relaxed), 0);
+    }
+
     struct RendererResult(bool, Arc<std::sync::atomic::AtomicUsize>);
     impl FrameRenderer for RendererResult {
         fn render(
@@ -548,6 +695,7 @@ mod failure_tests {
 
     #[test]
     fn renderer_terminal_error_is_not_cpu_fallback() {
+        let _guard = crate::tests::GPU_HOOK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (project, seq, sources) = crate::tests::project();
         assert!(!filmcraft_render::plan::is_cpu_frame(&project, seq, filmcraft_time::Tick::ZERO));
         let mut pipeline = Pipeline::new(project, seq, &ExportSettings { gpu_rendering: GpuRendering::Off, ..Default::default() }, false).unwrap();
@@ -574,6 +722,7 @@ mod failure_tests {
     }
     #[test]
     fn failed_render_cannot_become_encoder_pixels() {
+        let _guard = crate::tests::GPU_HOOK_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (project, seq, mut sources) = crate::tests::project();
         let video = project.sequence(seq).unwrap().video_tracks[0].items[0].item;
         let info = sources.0[&video].info().clone();

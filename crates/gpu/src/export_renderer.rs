@@ -149,15 +149,20 @@ impl ExportRenderer {
     /// render size), or `None` when this frame must go to the CPU renderer.
     pub fn render(&mut self, project: &Project, seq: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) -> Result<Option<Image>, String> {
         let plan = plan_frame(project, seq, t, opts, sources)?;
-        Ok(match &plan {
+        self.render_prepared(&plan)
+    }
+
+    /// Render an existing plan without planning or borrowing media sources again.
+    pub fn render_prepared(&mut self, plan: &FramePlan) -> Result<Option<Image>, String> {
+        Ok(match plan {
             // Already the CPU image: return it unchanged instead of rendering it twice.
             FramePlan::Image(img) => Some(img.clone()),
             FramePlan::Layers { .. } => {
                 if device_failed() {
                     return Ok(None);
                 }
-                let prep = prepare(&plan);
-                let Some((w, h, px)) = self.compositor.render_export_prepared(&plan, Some(&prep))? else { return Ok(None) };
+                let prep = prepare(plan);
+                let Some((w, h, px)) = self.compositor.render_export_prepared(plan, Some(&prep))? else { return Ok(None) };
                 // an error reported while this frame was drawn leaves its pixels untrusted
                 if device_failed() {
                     return Ok(None);
@@ -366,6 +371,30 @@ mod tests {
         let gpu = R(r).render(&p, seq, Tick::ZERO, RenderOptions::default(), &m).unwrap().expect("rendered");
         let cpu = filmcraft_render::render_sequence(&p, seq, Tick::ZERO, RenderOptions::default(), &m).unwrap();
         assert_parity(&cpu, &gpu, "frame renderer");
+    }
+
+    #[test]
+    fn prepared_render_matches_standard_render() {
+        let Some(mut renderer) = ExportRenderer::new() else {
+            eprintln!("SKIPPED (prepared render parity): no GPU adapter");
+            return;
+        };
+
+        for transform in [false, true] {
+            let (project, seq, sources) = project(transform);
+            let t = filmcraft_time::FrameRate::FPS_24.tick_of(10);
+            let opts = RenderOptions::default();
+
+            let standard = renderer.render(&project, seq, t, opts, &sources).expect("standard GPU render").expect("GPU accepted standard plan");
+
+            let plan = plan_frame(&project, seq, t, opts, &sources).expect("prepared plan");
+            assert!(matches!(&plan, FramePlan::Layers { layers, .. } if !layers.is_empty()), "expected a nonempty GPU layer plan");
+
+            let prepared = renderer.render_prepared(&plan).expect("prepared GPU render").expect("GPU accepted prepared plan");
+
+            assert_eq!((standard.w, standard.h), (prepared.w, prepared.h));
+            assert_eq!(standard.px, prepared.px, "standard and prepared GPU pixels differ (transform={transform})");
+        }
     }
 
     #[test]

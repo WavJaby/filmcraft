@@ -109,6 +109,16 @@ pub fn encoder_registered(f: EncoderFactory) -> bool {
 /// linear-light RGBA), or `None` to let the CPU render this frame (no adapter, a plan the GPU
 /// cannot draw). Terminal frame errors propagate; the CPU renderer remains the fallback.
 pub trait FrameRenderer: Send {
+    /// Stable for this renderer's lifetime; false keeps planning inside `render`.
+    fn supports_prepared_plan(&self) -> bool {
+        false
+    }
+
+    /// Draw an existing plan; `Ok(None)` declines, terminal frame errors propagate.
+    fn render_prepared(&mut self, _plan: &filmcraft_render::plan::FramePlan) -> std::result::Result<Option<filmcraft_render::Image>, String> {
+        Ok(None)
+    }
+
     fn render(
         &mut self,
         project: &Project,
